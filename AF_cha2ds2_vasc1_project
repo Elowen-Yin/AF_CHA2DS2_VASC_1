@@ -1,1 +1,4056 @@
+#####PSM
+rm(list=ls())
+library(readr)
+library(data.table)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(broom)
+library(tableone)
+library(ggrepel)
+library(readxl)
+library(survival)
+library(mice)
+library(MatchIt)
+library(cobalt)
+library(survminer)
+library(forestplot)
+library(grid)
+library(grf)
+library(lmtest)
+library(sandwich)
+library(car)
+library(cmprsk)
+
+
+#########Inclusion and exclusion
+data <- fread("D:/AF_IMRD/Data_IMRD/AF_cohort_disease_drug.csv")
+data <- data[, lapply(.SD, function(x) {
+  if (is.character(x)) {
+    x[x == "NULL"] <- NA
+  }
+  x})]
+
+assist <- data[is.na(data$yob), ]
+assist <- data[is.na(data$gender) , ]
+
+colnames(data)
+
+outcome_date_cols <- c(
+  "is_date",
+  "istt_date",
+  "tt_date",
+  "ib_date",
+  "gib_date",
+  "ob_date")
+data[, end_date1 := as.Date(end_date1)]
+data[, (outcome_date_cols) := lapply(.SD, as.Date),
+     .SDcols = outcome_date_cols]
+data[, (outcome_date_cols) := lapply(.SD, function(x) {
+  idx <- !is.na(x) &
+    !is.na(end_date1) &
+    x > end_date1
+  
+  x[idx] <- NA
+  x
+}), .SDcols = outcome_date_cols]
+
+
+sapply(data[, ..outcome_date_cols], class)
+sapply(data[, ..outcome_date_cols], typeof)
+
+class(as.Date(NA))
+typeof(as.Date(NA))
+
+
+date_cols <- c(
+  "birthday",
+  "dateofdeath",
+  "regenddate",
+  "af_date",
+  "ms_date",
+  "phv_date",
+  "date_at_65",
+  "date_at_75",
+  "hf_date",
+  "hpt_date",
+  "dm_date",
+  "ste_date",
+  "vd_date",
+  "ane_date",
+  "ckd_date",
+  "cpd_date",
+  "dementia_date",
+  "ld_date",
+  "cancer_date",
+  "alcohol_date",
+  
+  "date_score1",
+  "date_score_over1",
+  "index_date",
+  "study_end_date",
+  "last_record_date",
+  "last_record_regenddate",
+  "death_date",
+  "end_date1",
+  "end_date2",
+  "is_date",
+  "istt_date",
+  "tt_date",
+  "ib_date",
+  "gib_date",
+  "ob_date",
+  "oac_date")
+
+data[, (date_cols) := lapply(.SD, function(x) {
+  as.IDate(x, format = "%Y/%m/%d")
+}), .SDcols = date_cols]
+
+cohort <- subset(data,af_date>birthday)
+cohort <- cohort[
+  af_date  >= as.Date("1960-01-01")]
+cohort <- cohort[
+  af_date <= as.Date("2024-06-30")]
+
+
+#Age>=18
+cohort <- subset(cohort, age_at_AF>=18)
+
+#Patients with mitral stenosis before AF diagnosis
+cohort <- cohort[is.na(cohort$ms_date) | cohort$ms_date > cohort$af_date, ]
+#Patients with prosthetic heart valve before AF diagnosis
+cohort <- cohort[is.na(cohort$phv_date)|cohort$phv_date > cohort$af_date, ]
+
+
+#Patients directly from 0 to 2
+cohort <- cohort[!is.na(cohort$date_score1),]
+cohort <- subset(cohort, cohort$date_score1 != cohort$date_score_over1)
+
+#Patients reached 2 before AF diagnosis
+assist <- subset(cohort, date_score_over1<=af_date)
+cohort <- subset(cohort, date_score_over1>af_date)
+
+#Patients remains 0 until end_date
+assist <- subset(cohort, date_score1>=end_date1)
+cohort <- subset(cohort, date_score1<end_date1)
+
+#Patients with OAC before index date
+assist <- subset(cohort, oac_date<index_date)
+cohort <- cohort[is.na(cohort$oac_date) | cohort$oac_date >= cohort$index_date, ]
+
+#Patients with baseline IB
+AF_IB_BASE <- fread("D:/AF_IMRD/Data_IMRD/AF_IB_BASE.csv")
+cohort <- cohort[!patid %in% AF_IB_BASE$patid]
+
+#Patients with baseline cancer
+cohort <- cohort[
+  is.na(cancer_date) | cancer_date > index_date]
+
+#Without followup (index_date=end_date)
+a <- subset(
+  cohort,
+  index_date >= end_date1)
+cohort <- subset(cohort, index_date<end_date1)
+
+
+#########Score of 1, OAC initiation
+#Use OAC after index_date
+assist <- cohort[!is.na(cohort$oac_date) & cohort$oac_date < cohort$end_date2,]
+
+#Use OAC before end_date
+assist <- cohort[!is.na(cohort$oac_date)&cohort$oac_date < cohort$end_date1,]
+
+#If_OAC
+cohort$if_oac <- ifelse(
+  !is.na(cohort$oac_date) & cohort$oac_date < cohort$end_date1,1,0)
+table(cohort$if_oac)
+
+
+#Time distribution
+cohort[, score1_factor := NA_character_]
+
+cohort[date_score1 == date_at_65, score1_factor := "age65"]
+cohort[date_score1 == hf_date,    score1_factor := "hf"]
+cohort[date_score1 == hpt_date,   score1_factor := "hpt"]
+cohort[date_score1 == dm_date,    score1_factor := "dm"]
+cohort[date_score1 == vd_date,    score1_factor := "vd"]
+
+table(cohort$score1_factor)
+
+
+#5.3*5
+#Interval between af diagnosis and score1
+summary(cohort$af_date - cohort$date_score1)
+cohort$inter <- cohort$af_date - cohort$date_score1
+summary(cohort$inter)
+
+cohort$time_years <- as.numeric(cohort$af_date - cohort$date_score1) / 365.25
+
+q1  <- quantile(cohort$time_years, 0.25, na.rm = TRUE)
+med <- median(cohort$time_years, na.rm = TRUE)
+q3  <- quantile(cohort$time_years, 0.75, na.rm = TRUE)
+q1; med; q3
+
+ggplot(cohort, aes(x = time_years)) +
+  geom_histogram(bins = 50, fill = "skyblue", color = "white") +
+  annotate(
+    "text",
+    x = Inf,
+    y = Inf,
+    hjust = 1.1,
+    vjust = 1.5,
+    label = paste0(
+      "Median = ", round(med,1), " years\n",
+      "IQR = ", round(q1,1), "–", round(q3,1), " years"),
+    size = 4) +
+  labs(
+    x = "Years from CHA2DS2-VASc score = 1 to AF diagnosis",
+    y = "Number of patients") +
+  theme_bw()
+
+#Interval between index date and end date1
+summary(cohort$end_date1 - cohort$index_date)
+cohort$followup_years <- as.numeric(cohort$end_date1 - cohort$index_date) / 365.25
+
+q1  <- quantile(cohort$followup_years, 0.25, na.rm = TRUE)
+med <- median(cohort$followup_years, na.rm = TRUE)
+q3  <- quantile(cohort$followup_years, 0.75, na.rm = TRUE)
+
+q1; med; q3
+
+ggplot(cohort, aes(x = followup_years)) +
+  geom_histogram(bins = 50, fill = "skyblue", color = "white") +
+  annotate(
+    "text",
+    x = Inf,
+    y = Inf,
+    hjust = 1.1,
+    vjust = 1.5,
+    label = paste0(
+      "Median = ", round(med, 1), " years\n",
+      "IQR = ", round(q1, 1), "–", round(q3, 1), " years"),
+    size = 4) +
+  labs(
+    x = "Years from index date to end of follow-up",
+    y = "Number of patients") +
+  theme_bw()
+
+
+#Interval between index date and oac_date among OAC patients
+summary(cohort[if_oac==1,]$oac_date - cohort[if_oac==1,]$index_date)
+oac_patients <- cohort[if_oac == 1, ]
+
+oac_patients$oac_delay_months <- as.numeric(
+  oac_patients$oac_date - oac_patients$index_date) / (365.25 / 12)
+
+q1  <- quantile(oac_patients$oac_delay_months, 0.25, na.rm = TRUE)
+med <- median(oac_patients$oac_delay_months, na.rm = TRUE)
+q3  <- quantile(oac_patients$oac_delay_months, 0.75, na.rm = TRUE)
+
+q1; med; q3
+
+ggplot(oac_patients, aes(x = oac_delay_months)) +
+  geom_histogram(bins = 50, fill = "skyblue", color = "white") +
+  annotate(
+    "text",
+    x = Inf,
+    y = Inf,
+    hjust = 1.1,
+    vjust = 1.5,
+    label = paste0(
+      "Median = ", round(med, 1), " months\n",
+      "IQR = ", round(q1, 1), "–", round(q3, 1), " months"),
+    size = 4) +
+  labs(
+    x = "Months from index date to first OAC prescription",
+    y = "Number of patients",
+    title = "Distribution of time from index date to OAC initiation") +
+  theme_bw()
+
+
+
+#Interval between oac_date date and end_date1 among OAC patients
+summary(cohort[if_oac==1,]$end_date1 - cohort[if_oac==1,]$oac_date)
+
+oac_patients <- cohort[if_oac == 1, ]
+
+oac_patients$followup_after_oac_years <- as.numeric(
+  oac_patients$end_date1 - oac_patients$oac_date) / 365.25
+
+q1  <- quantile(oac_patients$followup_after_oac_years, 0.25, na.rm = TRUE)
+med <- median(oac_patients$followup_after_oac_years, na.rm = TRUE)
+q3  <- quantile(oac_patients$followup_after_oac_years, 0.75, na.rm = TRUE)
+
+q1; med; q3
+
+ggplot(oac_patients, aes(x = followup_after_oac_years)) +
+  geom_histogram(bins = 50, fill = "skyblue", color = "white") +
+  annotate(
+    "text",
+    x = Inf,
+    y = Inf,
+    hjust = 1.1,
+    vjust = 1.5,
+    label = paste0(
+      "Median = ", round(med, 1), " years\n",
+      "IQR = ", round(q1, 1), "–", round(q3, 1), " years"),
+    size = 4) +
+  labs(
+    x = "Years from first OAC prescription to end of follow-up",
+    y = "Number of patients",
+    title = "Distribution of follow-up time after OAC initiation") +
+  theme_bw()
+
+
+#########Baseline characteristics
+colnames(cohort)
+vars <- c(
+  "ane",
+  "ckd",
+  "cpd",
+  "dementia",
+  "ld",
+  "cancer",
+  "alcohol")
+
+for (v in vars) {
+  date_var <- paste0(v, "_date")
+  flag_var <- paste0("if_", v)
+  
+  cohort[, (flag_var) := as.integer(
+    !is.na(get(date_var)) &
+      get(date_var) <= index_date)]}
+
+
+#Medication
+antip_pres <- fread("D:/AF_IMRD/Data_IMRD/ANTIP_PRES.csv")
+nsaid_pres <- fread("D:/AF_IMRD/Data_IMRD/NSAID_PRES.csv")
+ppi_pres <- fread("D:/AF_IMRD/Data_IMRD/PPI_PRES.csv")
+lipid_pres <- fread("D:/AF_IMRD/Data_IMRD/LIPID_PRES.csv")
+beta_pres <- fread("D:/AF_IMRD/Data_IMRD/BETA_PRES.csv")
+ra_pres <- fread("D:/AF_IMRD/Data_IMRD/RA_PRES.csv")
+
+antip_pres <- antip_pres[,c("patid","antip_date")]
+nsaid_pres <- nsaid_pres[,c("patid","nsaid_date")]
+ppi_pres <- ppi_pres[,c("patid","ppi_date")]
+lipid_pres <- lipid_pres[,c("patid","lipid_date")]
+beta_pres <- beta_pres[,c("patid","beta_date")]
+ra_pres <- ra_pres[,c("patid","ra_date")]
+
+setDT(cohort)
+cohort[, row_id := .I]
+cohort[, index_date := as.Date(index_date)]
+
+cohort_window <- cohort[, .(
+  row_id,
+  patid,
+  start = index_date - 365,
+  end   = index_date - 1)]
+
+setkey(cohort_window, patid, start, end)
+
+#antip
+setDT(antip_pres)
+antip_pres[, antip_date := as.Date(antip_date)]
+antip_interval <- antip_pres[, .(
+  patid,
+  start = antip_date,
+  end   = antip_date)]
+setkey(antip_interval, patid, start, end)
+
+antip_flag <- foverlaps(
+  antip_interval,
+  cohort_window,
+  by.x = c("patid", "start", "end"),
+  by.y = c("patid", "start", "end"),
+  type = "within",
+  nomatch = 0
+)[, .(if_antip = 1L), by = row_id]
+
+cohort[, if_antip := 0L]
+cohort[antip_flag, on = "row_id", if_antip := i.if_antip]
+table(cohort$if_antip)
+
+
+#ppi
+setDT(ppi_pres)
+ppi_pres[, ppi_date := as.Date(ppi_date)]
+ppi_interval <- ppi_pres[, .(
+  patid,
+  start = ppi_date,
+  end   = ppi_date)]
+setkey(ppi_interval, patid, start, end)
+
+ppi_flag <- foverlaps(
+  ppi_interval,
+  cohort_window,
+  by.x = c("patid", "start", "end"),
+  by.y = c("patid", "start", "end"),
+  type = "within",
+  nomatch = 0
+)[, .(if_ppi = 1L), by = row_id]
+
+cohort[, if_ppi := 0L]
+cohort[ppi_flag, on = "row_id", if_ppi := i.if_ppi]
+table(cohort$if_ppi)
+
+
+#nsaid
+setDT(nsaid_pres)
+nsaid_pres[, nsaid_date := as.Date(nsaid_date)]
+nsaid_interval <- nsaid_pres[, .(
+  patid,
+  start = nsaid_date,
+  end   = nsaid_date)]
+setkey(nsaid_interval, patid, start, end)
+
+nsaid_flag <- foverlaps(
+  nsaid_interval,
+  cohort_window,
+  by.x = c("patid", "start", "end"),
+  by.y = c("patid", "start", "end"),
+  type = "within",
+  nomatch = 0
+)[, .(if_nsaid = 1L), by = row_id]
+
+cohort[, if_nsaid := 0L]
+cohort[nsaid_flag, on = "row_id", if_nsaid := i.if_nsaid]
+table(cohort$if_nsaid)
+
+
+#lipid
+setDT(lipid_pres)
+lipid_pres[, lipid_date := as.Date(lipid_date)]
+lipid_interval <- lipid_pres[, .(
+  patid,
+  start = lipid_date,
+  end   = lipid_date)]
+setkey(lipid_interval, patid, start, end)
+
+lipid_flag <- foverlaps(
+  lipid_interval,
+  cohort_window,
+  by.x = c("patid", "start", "end"),
+  by.y = c("patid", "start", "end"),
+  type = "within",
+  nomatch = 0
+)[, .(if_lipid = 1L), by = row_id]
+
+cohort[, if_lipid := 0L]
+cohort[lipid_flag, on = "row_id", if_lipid := i.if_lipid]
+table(cohort$if_lipid)
+
+
+#beta
+setDT(beta_pres)
+beta_pres[, beta_date := as.Date(beta_date)]
+beta_interval <- beta_pres[, .(
+  patid,
+  start = beta_date,
+  end   = beta_date)]
+setkey(beta_interval, patid, start, end)
+
+beta_flag <- foverlaps(
+  beta_interval,
+  cohort_window,
+  by.x = c("patid", "start", "end"),
+  by.y = c("patid", "start", "end"),
+  type = "within",
+  nomatch = 0
+)[, .(if_beta = 1L), by = row_id]
+
+cohort[, if_beta := 0L]
+cohort[beta_flag, on = "row_id", if_beta := i.if_beta]
+table(cohort$if_beta)
+
+
+#ra
+setDT(ra_pres)
+ra_pres[, ra_date := as.Date(ra_date)]
+ra_interval <- ra_pres[, .(
+  patid,
+  start = ra_date,
+  end   = ra_date)]
+setkey(ra_interval, patid, start, end)
+
+ra_flag <- foverlaps(
+  ra_interval,
+  cohort_window,
+  by.x = c("patid", "start", "end"),
+  by.y = c("patid", "start", "end"),
+  type = "within",
+  nomatch = 0
+)[, .(if_ra = 1L), by = row_id]
+
+cohort[, if_ra := 0L]
+cohort[ra_flag, on = "row_id", if_ra := i.if_ra]
+table(cohort$if_ra)
+
+
+
+#Baseline characteristics
+colnames(cohort)
+assist <- cohort[,c("gender","ethnicity", "imd", "age_at_AF","if_oac","score1_factor",
+                    "if_ane","if_ckd","if_cpd","if_dementia","if_ld","if_cancer","if_alcohol",
+                    "if_antip","if_ppi","if_nsaid","if_lipid","if_beta","if_ra")]
+assist$age_at_AF <- as.numeric(assist$age_at_AF)
+assist$imd <- as.factor(assist$imd)
+
+cols <- c("gender","ethnicity","if_oac","score1_factor",
+          "if_ane","if_ckd","if_cpd","if_dementia","if_ld","if_cancer","if_alcohol",
+          "if_antip","if_ppi","if_nsaid","if_lipid","if_beta","if_ra")
+assist[, (cols) := lapply(.SD, factor), .SDcols = cols]
+
+table1 <- CreateTableOne(data = assist, strata = "if_oac", addOverall = T) %>% 
+  print(noSpaces = T, showAllLevels = T,smd = TRUE)
+
+
+result <- data.table(
+  variable = names(cohort),
+  missing_n = sapply(cohort, function(x) sum(is.na(x))),
+  nonmissing_n = sapply(cohort, function(x) sum(!is.na(x))),
+  nonmissing_pct = round(
+    sapply(cohort, function(x) mean(!is.na(x))) * 100,
+    2))
+result[order(nonmissing_pct)]
+
+cohort[, year_of_entry := as.integer(format(index_date, "%Y"))]
+
+
+
+
+
+
+#########Outcome description
+colnames(cohort)
+#"is_date" "istt_date" "tt_date" "dateofdeath" "ib_date" "gib_date" "ob_date"
+
+#Outcome count
+event_vars <- c(
+  is = "is_date",
+  tt = "tt_date",
+  death = "dateofdeath",
+  ib = "ib_date",
+  gib = "gib_date",
+  ob = "ob_date")
+
+for (flag in names(event_vars)) {
+  date_var <- event_vars[[flag]]
+  cohort[, (paste0("if_", flag)) := as.integer(
+    !is.na(get(date_var)) &
+      get(date_var) > index_date &
+      get(date_var) <= end_date1)]}
+
+colnames(cohort)
+assist <- cohort[,c("if_oac","if_is","if_tt","if_death","if_ib","if_gib","if_ob")]
+
+cols <- c("if_is","if_tt","if_death","if_ib","if_gib","if_ob")
+assist[, (cols) := lapply(.SD, factor), .SDcols = cols]
+
+table1 <- CreateTableOne(data = assist, strata = "if_oac", addOverall = T) %>% 
+  print(noSpaces = T, showAllLevels = T,smd = TRUE)
+
+#Followup days
+date_cols <- c(
+  "index_date",
+  "end_date1",
+  "is_date",
+  "tt_date",
+  "dateofdeath",
+  "ib_date",
+  "gib_date",
+  "ob_date")
+
+cohort[, (date_cols) := lapply(.SD, as.Date), .SDcols = date_cols]
+
+follow_events <- c(
+  is = "is_date",
+  tt = "tt_date",
+  death = "dateofdeath",
+  ib = "ib_date",
+  gib = "gib_date",
+  ob = "ob_date")
+
+for (e in names(follow_events)) {
+  
+  date_var <- follow_events[[e]]
+  flag_var <- paste0("if_", e)
+  follow_var <- paste0(e, "_follow")
+  
+  cohort[, (follow_var) := as.numeric(
+    fifelse(
+      get(flag_var) == 1,
+      get(date_var) - index_date,
+      end_date1 - index_date))]}
+
+sum(cohort$is_follow)/365.25
+sum(cohort[cohort$if_oac==0,]$is_follow)/365.25
+sum(cohort[cohort$if_oac==1,]$is_follow)/365.25
+
+sum(cohort$tt_follow)/365.25
+sum(cohort[cohort$if_oac==0,]$tt_follow)/365.25
+sum(cohort[cohort$if_oac==1,]$tt_follow)/365.25
+
+sum(cohort$death_follow)/365.25
+sum(cohort[cohort$if_oac==0,]$death_follow)/365.25
+sum(cohort[cohort$if_oac==1,]$death_follow)/365.25
+
+sum(cohort$ib_follow)/365.25
+sum(cohort[cohort$if_oac==0,]$ib_follow)/365.25
+sum(cohort[cohort$if_oac==1,]$ib_follow)/365.25
+
+sum(cohort$gib_follow)/365.25
+sum(cohort[cohort$if_oac==0,]$gib_follow)/365.25
+sum(cohort[cohort$if_oac==1,]$gib_follow)/365.25
+
+sum(cohort$ob_follow)/365.25
+sum(cohort[cohort$if_oac==0,]$ob_follow)/365.25
+sum(cohort[cohort$if_oac==1,]$ob_follow)/365.25
+
+cohort[, age_at_index :=
+         floor(as.numeric(difftime(index_date, birthday, units = "days")) / 365.25)]
+
+ethn <- cohort[,c("patid","ethnicity")]
+table(ethn$ethnicity)
+cohort[, ethnicity := fifelse(
+  ethnicity == 6,
+  0L,
+  1L)]
+table(cohort$ethnicity, useNA = "ifany")
+
+
+#########Multiple imputation
+#Variables:imd
+setDT(cohort)
+imp_vars <- c("imd")
+
+imp_data <- cohort[, .(
+  gender, ethnicity, imd, age_at_AF, score1_factor,year_of_entry,
+  if_ane, if_ckd, if_cpd, if_dementia, if_ld, if_alcohol,
+  if_antip, if_ppi, if_nsaid, if_lipid, if_beta, if_ra)]
+imp_data[, imd := factor(imd, ordered = TRUE)]
+
+meth <- make.method(imp_data)
+meth["imd"]        <- "polr"
+meth[!(names(meth) %in% imp_vars)] <- ""
+
+pred <- make.predictorMatrix(imp_data)
+diag(pred) <- 0
+
+imp <- mice(
+  imp_data,
+  m = 5,
+  maxit = 5,
+  method = meth,
+  predictorMatrix = pred,
+  seed = 123)
+
+completed1 <- complete(imp, 4)
+cohort_imp <- copy(cohort)
+cohort_imp[, (imp_vars) := completed1[, imp_vars]]
+
+result <- data.table(
+  variable = names(cohort_imp),
+  missing_n = sapply(cohort_imp, function(x) sum(is.na(x))),
+  nonmissing_n = sapply(cohort_imp, function(x) sum(!is.na(x))),
+  nonmissing_pct = round(
+    sapply(cohort_imp, function(x) mean(!is.na(x))) * 100,
+    2))
+result[order(nonmissing_pct)]
+
+cohort_imp$imd <-as.numeric(cohort_imp$imd)
+cohort$imd <-as.numeric(cohort$imd)
+
+
+
+##########
+###Main analysis 1:2 PSM
+##########
+#is
+is_cohort <- cohort_imp[,c("patid","gender","ethnicity","imd","age_at_AF","year_of_entry","alcohol_date",
+                           "ane_date","ckd_date","cpd_date","dementia_date","ld_date","cancer_date",
+                           "index_date","end_date1","is_date","oac_date",
+                           "score1_factor","if_is")]
+
+is_cohort[, is_end_date := fifelse(
+  !is.na(is_date),
+  is_date,
+  end_date1)]
+
+
+#step1: calculate total trial number for each participant
+setDT(is_cohort)
+
+is_cohort[, index_date := as.Date(index_date)]
+is_cohort[, oac_date := as.Date(oac_date)]
+is_cohort[, is_end_date := as.Date(is_end_date)]
+is_cohort[, days_to_end := as.numeric(difftime(is_end_date, index_date, units = "days"))]
+is_cohort[, days_to_oac := as.numeric(difftime(oac_date, index_date, units = "days"))]
+
+is_cohort[, total_trial_num := fifelse(
+  is.na(oac_date) | oac_date >= is_end_date,
+  as.integer(floor(days_to_end / 30) + 1),
+  as.integer(floor(days_to_oac / 30) + 1))]
+#is_cohort[, c("days_to_end", "days_to_oac") := NULL]
+table(is_cohort$total_trial_num)
+
+
+#How many people in each trial
+trial_counts <- data.table(
+  trial_num = 1:max(is_cohort$total_trial_num))
+
+trial_counts[, n := sapply(
+  trial_num,
+  function(i) sum(is_cohort$total_trial_num >= i))]
+
+print(trial_counts, nrows = Inf)
+
+
+# Restrict the sequential trials to a maximum of 142
+is_cohort[, total_trial_num := pmin(total_trial_num, 142L)]
+
+# Check the updated distribution
+table(is_cohort$total_trial_num)
+
+# Recalculate the number of participants in each trial
+trial_counts_142 <- data.table(
+  trial_num = 1:142)
+
+trial_counts_142[, n := sapply(
+  trial_num,
+  function(i) sum(is_cohort$total_trial_num >= i))]
+
+print(trial_counts_142, nrows = Inf)
+
+
+
+#step2: Define the start and end date of each trial for each participant, if_IS, and followup days for each trial
+trial_data <- is_cohort[
+  rep(seq_len(nrow(is_cohort)), total_trial_num)]
+trial_data[, trial_num := seq_len(.N), by = patid]
+table(trial_data$trial_num)
+
+trial_data[, trial_start_date := index_date + (trial_num - 1) * 30]
+
+trial_data[, trial_end_date := pmin(
+  index_date + trial_num * 30 - 1,
+  is_end_date)]
+
+trial_data[, .(
+  patid,
+  index_date,
+  is_end_date,
+  total_trial_num,
+  trial_num,
+  trial_start_date,
+  trial_end_date)]
+
+#trial followup days
+trial_data[, trial_followup_days := as.numeric(
+  difftime(is_end_date, trial_start_date, units = "days")) + 1]
+
+
+#step3: define each participant's OAC and time-dependent variable happens in which trial
+#Before that trial: 0;  after that trial: 1
+#OAC
+trial_data[, if_oac := fifelse(
+  !is.na(oac_date) &
+    oac_date >= trial_start_date &
+    oac_date <= trial_end_date,
+  1L, 0L)]
+
+trial_data[, .(n_oac_trial = sum(if_oac)), by = patid][
+  n_oac_trial > 1]
+trial_data[if_oac == 1 & trial_num != total_trial_num]
+
+#Time-dependent covariates
+#comorbidities
+trial_data[, if_ane := fifelse(
+  !is.na(ane_date) & ane_date < trial_start_date,
+  1L, 0L)]
+trial_data[, if_ckd := fifelse(
+  !is.na(ckd_date) & ckd_date < trial_start_date,
+  1L, 0L)]
+trial_data[, if_cpd := fifelse(
+  !is.na(cpd_date) & cpd_date < trial_start_date,
+  1L, 0L)]
+trial_data[, if_dementia := fifelse(
+  !is.na(dementia_date) & dementia_date < trial_start_date,
+  1L, 0L)]
+trial_data[, if_ld := fifelse(
+  !is.na(ld_date) & ld_date < trial_start_date,
+  1L, 0L)]
+trial_data[, if_cancer := fifelse(
+  !is.na(cancer_date) & cancer_date < trial_start_date,
+  1L, 0L)]
+trial_data[, if_alcohol := fifelse(
+  !is.na(alcohol_date) & alcohol_date < trial_start_date,
+  1L, 0L)]
+
+#Medication
+add_baseline_med <- function(trial_data,
+                             med_data,
+                             date_col,
+                             new_var,
+                             window_days = 365){
+  td <- copy(trial_data)
+  med <- copy(med_data)
+  setDT(td)
+  setDT(med)
+  td[, trial_id := .I]
+  td[, trial_start_date := as.Date(trial_start_date)]
+  med[, med_date := as.Date(get(date_col))]
+  trial_window <- td[, .(
+    trial_id,
+    patid,
+    window_start = trial_start_date - window_days,
+    window_end   = trial_start_date - 1
+  )]
+  med_flag <- med[
+    trial_window,
+    on = .(
+      patid,
+      med_date >= window_start,
+      med_date <= window_end
+    ),
+    nomatch = 0,
+    allow.cartesian = TRUE
+  ][,.(flag = 1L),by = trial_id]
+  td[, (new_var) := 0L]
+  td[
+    med_flag,
+    on = "trial_id",
+    (new_var) := i.flag]
+  td[, trial_id := NULL]
+  return(td)
+}
+
+# Antiplatelet
+trial_data <- add_baseline_med(
+  trial_data,
+  antip_pres,
+  "antip_date",
+  "if_antip")
+
+# Lipid-lowering
+trial_data <- add_baseline_med(
+  trial_data,
+  lipid_pres,
+  "lipid_date",
+  "if_lipid")
+
+# PPI
+trial_data <- add_baseline_med(
+  trial_data,
+  ppi_pres,
+  "ppi_date",
+  "if_ppi")
+
+# NSAID
+trial_data <- add_baseline_med(
+  trial_data,
+  nsaid_pres,
+  "nsaid_date",
+  "if_nsaid")
+
+# BETA
+trial_data <- add_baseline_med(
+  trial_data,
+  beta_pres,
+  "beta_date",
+  "if_beta")
+
+# RA
+trial_data <- add_baseline_med(
+  trial_data,
+  ra_pres,
+  "ra_date",
+  "if_ra")
+
+
+### PSM within each trial
+### 1:2 nearest-neighbor matching
+trial_data_model <- trial_data
+setDT(trial_data_model)
+# 1. Define matching variables
+match_vars <- c(
+  "age_at_AF", "gender", "ethnicity", "imd", "score1_factor","year_of_entry",
+  "if_ane", "if_ckd", "if_cpd", "if_dementia", "if_ld",  "if_cancer","if_alcohol",
+  "if_antip", "if_ppi", "if_nsaid", "if_lipid","if_beta","if_ra")
+
+factor_vars_psm <- c(
+  "gender", "ethnicity", "score1_factor",
+  "if_ane", "if_ckd", "if_cpd", "if_dementia", "if_ld",  "if_cancer","if_alcohol",
+  "if_antip", "if_ppi", "if_nsaid", "if_lipid","if_beta","if_ra")
+
+factor_vars_psm <- intersect(factor_vars_psm, names(trial_data_model))
+match_vars <- intersect(match_vars, names(trial_data_model))
+
+trial_data_model[, assigned_treat := as.integer(if_oac)]
+trial_data_model[, age_at_AF := as.numeric(as.character(age_at_AF))]
+trial_data_model[, imd := as.numeric(as.character(imd))]
+trial_data_model[, (factor_vars_psm) := lapply(.SD, as.factor), .SDcols = factor_vars_psm]
+
+psm_data <- trial_data_model[
+  complete.cases(trial_data_model[, ..match_vars]) &
+    !is.na(assigned_treat)]
+psm_data[, row_id_psm := .I]
+
+
+# 2. Function: match within one trial
+match_one_trial <- function(dt, ratio = 2) {
+  dt <- copy(dt)
+  this_trial <- unique(dt$trial_num)
+  n_treat <- sum(dt$assigned_treat == 1, na.rm = TRUE)
+  n_control <- sum(dt$assigned_treat == 0, na.rm = TRUE)
+  if (n_treat == 0 | n_control == 0) {
+    return(list(
+      matched = NULL,
+      log = data.table(
+        trial_num = this_trial,
+        n_treat = n_treat,
+        n_control = n_control,
+        matched_n = 0,
+        status = "Skipped: no treated or no control")))}
+  actual_ratio <- min(ratio, floor(n_control / n_treat))
+  if (actual_ratio < 1) {
+    return(list(
+      matched = NULL,
+      log = data.table(
+        trial_num = this_trial,
+        n_treat = n_treat,
+        n_control = n_control,
+        matched_n = 0,
+        status = "Skipped: insufficient controls")))}
+  use_vars <- match_vars[
+    sapply(match_vars, function(v) {
+      length(unique(dt[[v]][!is.na(dt[[v]])])) > 1})]
+  if (length(use_vars) == 0) {
+    return(list(
+      matched = NULL,
+      log = data.table(
+        trial_num = this_trial,
+        n_treat = n_treat,
+        n_control = n_control,
+        matched_n = 0,
+        status = "Skipped: no usable covariates")))}
+  
+  fml <- as.formula(
+    paste("assigned_treat ~", paste(use_vars, collapse = " + ")))
+  m <- tryCatch(
+    matchit(
+      formula = fml,
+      data = dt,
+      method = "nearest",
+      ratio = actual_ratio,
+      replace = FALSE,
+      distance = "glm",
+      caliper = 0.2
+    ),
+    error = function(e) e)
+  if (inherits(m, "error")) {
+    return(list(
+      matched = NULL,
+      log = data.table(
+        trial_num = this_trial,
+        n_treat = n_treat,
+        n_control = n_control,
+        matched_n = 0,
+        status = paste0("Error: ", m$message))))}
+  matched <- as.data.table(match.data(m))
+  matched[, trial_num := this_trial]
+  matched[, actual_ratio := actual_ratio]
+  return(list(
+    matched = matched,
+    log = data.table(
+      trial_num = this_trial,
+      n_treat = n_treat,
+      n_control = n_control,
+      matched_n = nrow(matched),
+      status = paste0("Matched: 1:", actual_ratio))))}
+
+# 3. Run matching by trial
+psm_results <- psm_data[,
+                        {dt_one <- copy(.SD)
+                        dt_one[, trial_num := .BY$trial_num]
+                        res <- match_one_trial(dt_one, ratio = 2)
+                        .(matched = list(res$matched),
+                          log = list(res$log))},
+                        by = trial_num]
+
+matched_trial_data <- rbindlist(
+  psm_results$matched,
+  fill = TRUE)
+
+psm_log <- rbindlist(
+  psm_results$log,
+  fill = TRUE)
+
+# 4. Check matching results
+psm_log[, .N, by = status][order(status)]
+matched_trial_data[, .N, by = assigned_treat]
+matched_trial_data[
+  ,
+  .N,
+  by = .(trial_num, assigned_treat)
+][order(trial_num, assigned_treat)]
+
+#Summary
+matched_trial_summary <- matched_trial_data[,.(
+  total_n = .N,
+  if_oac_1 = sum(if_oac == 1L, na.rm = TRUE),
+  if_oac_0 = sum(if_oac == 0L, na.rm = TRUE)),
+  by = trial_num][order(trial_num)]
+print(matched_trial_summary, nrows = Inf)
+all_trials <- data.table(
+  trial_num = 1:142)
+matched_trial_summary_full <- merge(
+  all_trials,
+  matched_trial_summary,
+  by = "trial_num",
+  all.x = TRUE)
+matched_trial_summary_full[
+  is.na(total_n),
+  `:=`(total_n = 0L,
+       if_oac_1 = 0L,
+       if_oac_0 = 0L)]
+print(matched_trial_summary_full,
+      nrows = Inf)
+
+
+cox_is_full <- coxph(
+  Surv(trial_followup_days, if_is == 1) ~ 
+    assigned_treat +
+    age_at_AF +gender + ethnicity + imd + score1_factor +year_of_entry+
+    if_ane + if_ckd + if_cpd + if_dementia + if_ld  + if_cancer + if_alcohol +
+    if_antip + if_ppi + if_nsaid + if_lipid + if_beta + if_ra +
+    cluster(patid),
+  data = matched_trial_data,
+  method = "efron")
+ShowRegTable(cox_is_full)
+
+
+
+bal.tab(
+  assigned_treat ~ age_at_AF + gender + ethnicity + imd + score1_factor +year_of_entry+
+    if_ane + if_ckd + if_cpd + if_dementia + if_ld + if_cancer + if_alcohol+
+    if_antip + if_ppi + if_nsaid + if_lipid+if_beta+if_ra,
+  data = matched_trial_data,
+  weights = trial_data_iptw$weights*trial_data_iptw$IPTW_trunc)
+#none
+
+#Covariate balance plot
+#7*7
+setDT(psm_data)
+setDT(trial_data_iptw)
+stopifnot(
+  "row_id_psm" %in% names(psm_data),
+  "row_id_psm" %in% names(trial_data_iptw),
+  "weights" %in% names(trial_data_iptw))
+
+balance_data <- copy(psm_data)
+balance_data[, psm_weight := 0]
+matched_weights <- trial_data_iptw[
+  ,
+  .(
+    psm_weight = sum(weights, na.rm = TRUE)
+  ),
+  by = row_id_psm]
+
+balance_data[
+  matched_weights,
+  on = "row_id_psm",
+  psm_weight := i.psm_weight]
+
+balance_data[,
+             .(
+               before_matching = .N,
+               after_matching = sum(psm_weight > 0),
+               total_matching_weight = sum(psm_weight))]
+
+balance_data[
+  psm_weight > 0,
+  .(
+    N = .N,
+    weighted_N = sum(psm_weight)
+  ),
+  by = assigned_treat]
+
+balance_data[, ethnicity := as.character(ethnicity)]
+
+ethnicity_map <- c(
+  "0" = "White",
+  "1" = "Non-white")
+
+balance_data[
+  ,
+  ethnicity := factor(
+    ethnicity,
+    levels = names(ethnicity_map),
+    labels = unname(ethnicity_map))]
+
+table(balance_data$ethnicity, useNA = "ifany")
+
+balance_data[, score1_factor := as.character(score1_factor)]
+score_factor_map <- c(
+  "age65" = "Age 65 to 74 years",
+  "dm"    = "Diabetes mellitus",
+  "hf"    = "Heart failure",
+  "hpt"   = "Hypertension",
+  "vd"    = "Vascular disease")
+
+unknown_score_factor <- setdiff(
+  unique(na.omit(balance_data$score1_factor)),
+  names(score_factor_map))
+
+if (length(unknown_score_factor) > 0) {
+  warning(
+    "The following score1_factor levels were not included in score_factor_map: ",
+    paste(unknown_score_factor, collapse = ", "))}
+
+balance_data[
+  ,
+  score1_factor := factor(
+    score1_factor,
+    levels = names(score_factor_map),
+    labels = unname(score_factor_map))]
+
+table(balance_data$score1_factor, useNA = "ifany")
+
+balance_data[, assigned_treat := as.integer(assigned_treat)]
+balance_data[, age_at_AF := as.numeric(as.character(age_at_AF))]
+balance_data[, imd := as.numeric(as.character(imd))]
+
+binary_factor_vars <- c(
+  "gender",
+  "if_ane",
+  "if_ckd",
+  "if_cpd",
+  "if_dementia",
+  "if_ld",
+  "if_cancer",
+  "if_alcohol",
+  "if_antip",
+  "if_ppi",
+  "if_nsaid",
+  "if_lipid",
+  "if_beta",
+  "if_rd")
+
+binary_factor_vars <- intersect(
+  binary_factor_vars,
+  names(balance_data))
+
+balance_data[
+  ,
+  (binary_factor_vars) := lapply(.SD, as.factor),
+  .SDcols = binary_factor_vars]
+
+balance_formula <- assigned_treat ~
+  age_at_AF +
+  gender +
+  ethnicity +
+  imd +
+  score1_factor +
+  year_of_entry +
+  
+  if_ane +
+  if_ckd +
+  if_cpd +
+  if_dementia +
+  if_ld +
+  if_cancer +
+  if_alcohol +
+  if_antip +
+  if_ppi +
+  if_nsaid +
+  if_lipid +
+  if_beta +
+  if_ra
+
+balance_result <- bal.tab(
+  balance_formula,
+  data = balance_data,
+  weights = balance_data$psm_weight,
+  un = TRUE,
+  s.d.denom = "pooled",
+  binary = "std",
+  thresholds = c(m = 0.1))
+
+print(balance_result)
+
+balance_names <- rownames(balance_result$Balance)
+pretty_names <- balance_names
+
+pretty_names[balance_names == "age_at_AF"] <-
+  "Age (years)"
+
+pretty_names[balance_names == "imd"] <-
+  "Index of Multiple Deprivation"
+
+pretty_names <- gsub(
+  "^gender_.*$",
+  "Gender",
+  pretty_names)
+
+pretty_names <- gsub(
+  "^ethnicity_",
+  "Ethnicity: ",
+  pretty_names)
+
+pretty_names[balance_names == "year_of_entry"] <-
+  "Year of entry"
+
+pretty_names <- gsub(
+  "^score1_factor_",
+  "CHA2DS2-VASc factor: ",
+  pretty_names)
+
+pretty_names <- gsub(
+  "^if_ane(_1)?$",
+  "Anemia",
+  pretty_names)
+
+pretty_names <- gsub(
+  "^if_ckd(_1)?$",
+  "Renal disease",
+  pretty_names)
+
+pretty_names <- gsub(
+  "^if_cpd(_1)?$",
+  "Chronic respiratory disease",
+  pretty_names)
+
+pretty_names <- gsub(
+  "^if_dementia(_1)?$",
+  "Dementia",
+  pretty_names)
+
+pretty_names <- gsub(
+  "^if_ld(_1)?$",
+  "Liver disease",
+  pretty_names)
+
+pretty_names <- gsub(
+  "^if_cancer(_1)?$",
+  "Cancer",
+  pretty_names)
+
+pretty_names <- gsub(
+  "^if_alcohol(_1)?$",
+  "Alcohol misuse",
+  pretty_names)
+
+
+pretty_names <- gsub(
+  "^if_antip(_1)?$",
+  "Antiplatelet use",
+  pretty_names)
+
+pretty_names <- gsub(
+  "^if_ppi(_1)?$",
+  "PPI use",
+  pretty_names)
+
+pretty_names <- gsub(
+  "^if_nsaid(_1)?$",
+  "NSAID use",
+  pretty_names)
+
+pretty_names <- gsub(
+  "^if_lipid(_1)?$",
+  "Lipid-lowering therapy",
+  pretty_names)
+
+pretty_names <- gsub(
+  "^if_beta(_1)?$",
+  "Beta blocking agents",
+  pretty_names)
+
+pretty_names <- gsub(
+  "^if_ra(_1)?$",
+  "Renin-Angiotensin system drug",
+  pretty_names)
+
+
+variable_labels <- setNames(
+  pretty_names,
+  balance_names)
+
+data.table(
+  original_name = balance_names,
+  displayed_name = pretty_names)
+p_balance <- love.plot(
+  balance_result,
+  stats = "mean.diffs",
+  abs = TRUE,
+  thresholds = c(m = 0.1),
+  var.order = "unadjusted",
+  sample.names = c(
+    "Before matching",
+    "After matching"),
+  colors = c(
+    "#c63d48",
+    "#4264a4"),
+  shapes = c(
+    16,
+    17),
+  line = FALSE,
+  size = 3,
+  var.names = variable_labels) +
+  labs(
+    title = "Effectiveness analysis",
+    x = "Absolute Standardized Mean Difference",
+    y = NULL) +
+  theme_bw(base_size = 11) +
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,
+      face = "bold",
+      size = 14),
+    legend.position = "top",
+    legend.title = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.y = element_line(
+      linewidth = 0.3,
+      colour = "grey90"),
+    panel.grid.major.x = element_line(
+      linewidth = 0.3,
+      colour = "grey85"),
+    axis.text.y = element_text(
+      size = 8.5,
+      colour = "black"),
+    axis.text.x = element_text(
+      size = 10,
+      colour = "black"),
+    axis.title.x = element_text(
+      face = "bold",
+      size = 11),
+    plot.margin = margin(
+      t = 5,
+      r = 15,
+      b = 5,
+      l = 25))
+p_balance
+
+
+
+
+
+
+
+
+#tt
+tt_cohort <- cohort_imp[,c("patid","gender","ethnicity","imd","age_at_AF","year_of_entry","alcohol_date",
+                           "ane_date","ckd_date","cpd_date","dementia_date","ld_date","cancer_date",
+                           "index_date","end_date1","tt_date","oac_date",
+                           "score1_factor","if_tt")]
+
+tt_cohort[, tt_end_date := fifelse(
+  !is.na(tt_date),
+  tt_date,
+  end_date1)]
+
+
+#step1: calculate total trial number for each participant
+setDT(tt_cohort)
+
+tt_cohort[, index_date := as.Date(index_date)]
+tt_cohort[, oac_date := as.Date(oac_date)]
+tt_cohort[, tt_end_date := as.Date(tt_end_date)]
+tt_cohort[, days_to_end := as.numeric(difftime(tt_end_date, index_date, units = "days"))]
+tt_cohort[, days_to_oac := as.numeric(difftime(oac_date, index_date, units = "days"))]
+
+tt_cohort[, total_trial_num := fifelse(
+  is.na(oac_date) | oac_date >= tt_end_date,
+  as.integer(floor(days_to_end / 30) + 1),
+  as.integer(floor(days_to_oac / 30) + 1))]
+#tt_cohort[, c("days_to_end", "days_to_oac") := NULL]
+table(tt_cohort$total_trial_num)
+#455
+
+
+#How many people in each trial
+trial_counts <- data.table(
+  trial_num = 1:max(tt_cohort$total_trial_num))
+
+trial_counts[, n := sapply(
+  trial_num,
+  function(i) sum(tt_cohort$total_trial_num >= i))]
+
+print(trial_counts, nrows = Inf)
+
+
+# Restrict the sequential trials to a maximum of 142
+tt_cohort[, total_trial_num := pmin(total_trial_num, 142L)]
+
+# Check the updated dtttribution
+table(tt_cohort$total_trial_num)
+
+# Recalculate the number of participants in each trial
+trial_counts_142 <- data.table(
+  trial_num = 1:142)
+
+trial_counts_142[, n := sapply(
+  trial_num,
+  function(i) sum(tt_cohort$total_trial_num >= i))]
+
+print(trial_counts_142, nrows = Inf)
+
+
+
+#step2: Define the start and end date of each trial for each participant, if_IS, and followup days for each trial
+trial_data <- tt_cohort[
+  rep(seq_len(nrow(tt_cohort)), total_trial_num)]
+trial_data[, trial_num := seq_len(.N), by = patid]
+table(trial_data$trial_num)
+
+trial_data[, trial_start_date := index_date + (trial_num - 1) * 30]
+
+trial_data[, trial_end_date := pmin(
+  index_date + trial_num * 30 - 1,
+  tt_end_date)]
+
+trial_data[, .(
+  patid,
+  index_date,
+  tt_end_date,
+  total_trial_num,
+  trial_num,
+  trial_start_date,
+  trial_end_date)]
+
+#trial followup days
+trial_data[, trial_followup_days := as.numeric(
+  difftime(tt_end_date, trial_start_date, units = "days")) + 1]
+
+
+#step3: define each participant's OAC and time-dependent variable happens in which trial
+#Before that trial: 0;  after that trial: 1
+#OAC
+trial_data[, if_oac := fifelse(
+  !is.na(oac_date) &
+    oac_date >= trial_start_date &
+    oac_date <= trial_end_date,
+  1L, 0L)]
+
+trial_data[, .(n_oac_trial = sum(if_oac)), by = patid][
+  n_oac_trial > 1]
+trial_data[if_oac == 1 & trial_num != total_trial_num]
+
+#Time-dependent covariates
+#comorbidities
+trial_data[, if_ane := fifelse(
+  !is.na(ane_date) & ane_date < trial_start_date,
+  1L, 0L)]
+trial_data[, if_ckd := fifelse(
+  !is.na(ckd_date) & ckd_date < trial_start_date,
+  1L, 0L)]
+trial_data[, if_cpd := fifelse(
+  !is.na(cpd_date) & cpd_date < trial_start_date,
+  1L, 0L)]
+trial_data[, if_dementia := fifelse(
+  !is.na(dementia_date) & dementia_date < trial_start_date,
+  1L, 0L)]
+trial_data[, if_ld := fifelse(
+  !is.na(ld_date) & ld_date < trial_start_date,
+  1L, 0L)]
+trial_data[, if_cancer := fifelse(
+  !is.na(cancer_date) & cancer_date < trial_start_date,
+  1L, 0L)]
+trial_data[, if_alcohol := fifelse(
+  !is.na(alcohol_date) & alcohol_date < trial_start_date,
+  1L, 0L)]
+
+#Medication
+add_baseline_med <- function(trial_data,
+                             med_data,
+                             date_col,
+                             new_var,
+                             window_days = 365){
+  td <- copy(trial_data)
+  med <- copy(med_data)
+  setDT(td)
+  setDT(med)
+  td[, trial_id := .I]
+  td[, trial_start_date := as.Date(trial_start_date)]
+  med[, med_date := as.Date(get(date_col))]
+  trial_window <- td[, .(
+    trial_id,
+    patid,
+    window_start = trial_start_date - window_days,
+    window_end   = trial_start_date - 1
+  )]
+  med_flag <- med[
+    trial_window,
+    on = .(
+      patid,
+      med_date >= window_start,
+      med_date <= window_end
+    ),
+    nomatch = 0,
+    allow.cartesian = TRUE
+  ][,.(flag = 1L),by = trial_id]
+  td[, (new_var) := 0L]
+  td[
+    med_flag,
+    on = "trial_id",
+    (new_var) := i.flag]
+  td[, trial_id := NULL]
+  return(td)
+}
+
+# Antiplatelet
+trial_data <- add_baseline_med(
+  trial_data,
+  antip_pres,
+  "antip_date",
+  "if_antip")
+
+# Lipid-lowering
+trial_data <- add_baseline_med(
+  trial_data,
+  lipid_pres,
+  "lipid_date",
+  "if_lipid")
+
+# PPI
+trial_data <- add_baseline_med(
+  trial_data,
+  ppi_pres,
+  "ppi_date",
+  "if_ppi")
+
+# NSAID
+trial_data <- add_baseline_med(
+  trial_data,
+  nsaid_pres,
+  "nsaid_date",
+  "if_nsaid")
+
+# BETA
+trial_data <- add_baseline_med(
+  trial_data,
+  beta_pres,
+  "beta_date",
+  "if_beta")
+
+# RA
+trial_data <- add_baseline_med(
+  trial_data,
+  ra_pres,
+  "ra_date",
+  "if_ra")
+
+
+### PSM within each trial
+### 1:2 nearest-neighbor matching
+trial_data_model <- trial_data
+setDT(trial_data_model)
+# 1. Define matching variables
+match_vars <- c(
+  "age_at_AF", "gender", "ethnicity", "imd", "score1_factor","year_of_entry",
+  "if_ane", "if_ckd", "if_cpd", "if_dementia", "if_ld",  "if_cancer","if_alcohol",
+  "if_antip", "if_ppi", "if_nsaid", "if_lipid","if_beta","if_ra")
+
+factor_vars_psm <- c(
+  "gender", "ethnicity", "score1_factor",
+  "if_ane", "if_ckd", "if_cpd", "if_dementia", "if_ld",  "if_cancer","if_alcohol",
+  "if_antip", "if_ppi", "if_nsaid", "if_lipid","if_beta","if_ra")
+
+factor_vars_psm <- intersect(factor_vars_psm, names(trial_data_model))
+match_vars <- intersect(match_vars, names(trial_data_model))
+
+trial_data_model[, assigned_treat := as.integer(if_oac)]
+trial_data_model[, age_at_AF := as.numeric(as.character(age_at_AF))]
+trial_data_model[, imd := as.numeric(as.character(imd))]
+trial_data_model[, (factor_vars_psm) := lapply(.SD, as.factor), .SDcols = factor_vars_psm]
+
+psm_data <- trial_data_model[
+  complete.cases(trial_data_model[, ..match_vars]) &
+    !is.na(assigned_treat)]
+psm_data[, row_id_psm := .I]
+
+
+# 2. Function: match within one trial
+match_one_trial <- function(dt, ratio = 2) {
+  dt <- copy(dt)
+  thtt_trial <- unique(dt$trial_num)
+  n_treat <- sum(dt$assigned_treat == 1, na.rm = TRUE)
+  n_control <- sum(dt$assigned_treat == 0, na.rm = TRUE)
+  if (n_treat == 0 | n_control == 0) {
+    return(list(
+      matched = NULL,
+      log = data.table(
+        trial_num = thtt_trial,
+        n_treat = n_treat,
+        n_control = n_control,
+        matched_n = 0,
+        status = "Skipped: no treated or no control")))}
+  actual_ratio <- min(ratio, floor(n_control / n_treat))
+  if (actual_ratio < 1) {
+    return(list(
+      matched = NULL,
+      log = data.table(
+        trial_num = thtt_trial,
+        n_treat = n_treat,
+        n_control = n_control,
+        matched_n = 0,
+        status = "Skipped: insufficient controls")))}
+  use_vars <- match_vars[
+    sapply(match_vars, function(v) {
+      length(unique(dt[[v]][!is.na(dt[[v]])])) > 1})]
+  if (length(use_vars) == 0) {
+    return(list(
+      matched = NULL,
+      log = data.table(
+        trial_num = thtt_trial,
+        n_treat = n_treat,
+        n_control = n_control,
+        matched_n = 0,
+        status = "Skipped: no usable covariates")))}
+  
+  fml <- as.formula(
+    paste("assigned_treat ~", paste(use_vars, collapse = " + ")))
+  m <- tryCatch(
+    matchit(
+      formula = fml,
+      data = dt,
+      method = "nearest",
+      ratio = actual_ratio,
+      replace = FALSE,
+      distance = "glm",
+      caliper = 0.2
+    ),
+    error = function(e) e)
+  if (inherits(m, "error")) {
+    return(list(
+      matched = NULL,
+      log = data.table(
+        trial_num = thtt_trial,
+        n_treat = n_treat,
+        n_control = n_control,
+        matched_n = 0,
+        status = paste0("Error: ", m$message))))}
+  matched <- as.data.table(match.data(m))
+  matched[, trial_num := thtt_trial]
+  matched[, actual_ratio := actual_ratio]
+  return(list(
+    matched = matched,
+    log = data.table(
+      trial_num = thtt_trial,
+      n_treat = n_treat,
+      n_control = n_control,
+      matched_n = nrow(matched),
+      status = paste0("Matched: 1:", actual_ratio))))}
+
+# 3. Run matching by trial
+psm_results <- psm_data[,
+                        {dt_one <- copy(.SD)
+                        dt_one[, trial_num := .BY$trial_num]
+                        res <- match_one_trial(dt_one, ratio = 2)
+                        .(matched = list(res$matched),
+                          log = list(res$log))},
+                        by = trial_num]
+
+matched_trial_data <- rbindlist(
+  psm_results$matched,
+  fill = TRUE)
+
+psm_log <- rbindlist(
+  psm_results$log,
+  fill = TRUE)
+
+# 4. Check matching results
+psm_log[, .N, by = status][order(status)]
+matched_trial_data[, .N, by = assigned_treat]
+matched_trial_data[
+  ,
+  .N,
+  by = .(trial_num, assigned_treat)
+][order(trial_num, assigned_treat)]
+
+
+#Summary
+matched_trial_summary <- matched_trial_data[,.(
+  total_n = .N,
+  if_oac_1 = sum(if_oac == 1L, na.rm = TRUE),
+  if_oac_0 = sum(if_oac == 0L, na.rm = TRUE)),
+  by = trial_num][order(trial_num)]
+print(matched_trial_summary, nrows = Inf)
+all_trials <- data.table(
+  trial_num = 1:142)
+matched_trial_summary_full <- merge(
+  all_trials,
+  matched_trial_summary,
+  by = "trial_num",
+  all.x = TRUE)
+matched_trial_summary_full[
+  is.na(total_n),
+  `:=`(total_n = 0L,
+       if_oac_1 = 0L,
+       if_oac_0 = 0L)]
+print(matched_trial_summary_full,
+      nrows = Inf)
+
+
+cox_tt_full <- coxph(
+  Surv(trial_followup_days, if_tt == 1) ~ 
+    assigned_treat +
+    age_at_AF +gender + ethnicity + imd + score1_factor +year_of_entry+
+    if_ane + if_ckd + if_cpd + if_dementia + if_ld  + if_cancer + if_alcohol +
+    if_antip + if_ppi + if_nsaid + if_lipid + if_beta + if_ra +
+    cluster(patid),
+  data = matched_trial_data,
+  method = "efron")
+ShowRegTable(cox_tt_full)
+
+
+
+
+
+#death
+death_cohort <- cohort_imp[,c("patid","gender","ethnicity","imd","age_at_AF","year_of_entry","alcohol_date",
+                              "ane_date","ckd_date","cpd_date","dementia_date","ld_date","cancer_date",
+                              "index_date","end_date1","death_date","oac_date",
+                              "score1_factor","if_death")]
+death_cohort$death_date <- as.Date(death_cohort$death_date)
+death_cohort$end_date1 <- as.Date(death_cohort$end_date1)
+
+death_cohort[, death_end_date := fifelse(
+  !is.na(death_date),
+  death_date,
+  end_date1)]
+
+
+#step1: calculate total trial number for each participant
+setDT(death_cohort)
+
+death_cohort[, index_date := as.Date(index_date)]
+death_cohort[, oac_date := as.Date(oac_date)]
+death_cohort[, death_end_date := as.Date(death_end_date)]
+death_cohort[, days_to_end := as.numeric(difftime(death_end_date, index_date, units = "days"))]
+death_cohort[, days_to_oac := as.numeric(difftime(oac_date, index_date, units = "days"))]
+
+death_cohort[, total_trial_num := fifelse(
+  is.na(oac_date) | oac_date >= death_end_date,
+  as.integer(floor(days_to_end / 30) + 1),
+  as.integer(floor(days_to_oac / 30) + 1))]
+#death_cohort[, c("days_to_end", "days_to_oac") := NULL]
+table(death_cohort$total_trial_num)
+
+
+#How many people in each trial
+trial_counts <- data.table(
+  trial_num = 1:max(death_cohort$total_trial_num))
+
+trial_counts[, n := sapply(
+  trial_num,
+  function(i) sum(death_cohort$total_trial_num >= i))]
+
+print(trial_counts, nrows = Inf)
+
+
+# Restrict the sequential trials to a maximum of 142
+death_cohort[, total_trial_num := pmin(total_trial_num, 142L)]
+
+# Check the updated ddeathtribution
+table(death_cohort$total_trial_num)
+
+# Recalculate the number of participants in each trial
+trial_counts_142 <- data.table(
+  trial_num = 1:142)
+
+trial_counts_142[, n := sapply(
+  trial_num,
+  function(i) sum(death_cohort$total_trial_num >= i))]
+
+print(trial_counts_142, nrows = Inf)
+
+
+
+#step2: Define the start and end date of each trial for each participant, if_IS, and followup days for each trial
+trial_data <- death_cohort[
+  rep(seq_len(nrow(death_cohort)), total_trial_num)]
+trial_data[, trial_num := seq_len(.N), by = patid]
+table(trial_data$trial_num)
+
+trial_data[, trial_start_date := index_date + (trial_num - 1) * 30]
+
+trial_data[, trial_end_date := pmin(
+  index_date + trial_num * 30 - 1,
+  death_end_date)]
+
+trial_data[, .(
+  patid,
+  index_date,
+  death_end_date,
+  total_trial_num,
+  trial_num,
+  trial_start_date,
+  trial_end_date)]
+
+#trial followup days
+trial_data[, trial_followup_days := as.numeric(
+  difftime(death_end_date, trial_start_date, units = "days")) + 1]
+
+
+#step3: define each participant's OAC and time-dependent variable happens in which trial
+#Before that trial: 0;  after that trial: 1
+#OAC
+trial_data[, if_oac := fifelse(
+  !is.na(oac_date) &
+    oac_date >= trial_start_date &
+    oac_date <= trial_end_date,
+  1L, 0L)]
+
+trial_data[, .(n_oac_trial = sum(if_oac)), by = patid][
+  n_oac_trial > 1]
+trial_data[if_oac == 1 & trial_num != total_trial_num]
+
+#Time-dependent covariates
+#comorbidities
+trial_data[, if_ane := fifelse(
+  !is.na(ane_date) & ane_date < trial_start_date,
+  1L, 0L)]
+trial_data[, if_ckd := fifelse(
+  !is.na(ckd_date) & ckd_date < trial_start_date,
+  1L, 0L)]
+trial_data[, if_cpd := fifelse(
+  !is.na(cpd_date) & cpd_date < trial_start_date,
+  1L, 0L)]
+trial_data[, if_dementia := fifelse(
+  !is.na(dementia_date) & dementia_date < trial_start_date,
+  1L, 0L)]
+trial_data[, if_ld := fifelse(
+  !is.na(ld_date) & ld_date < trial_start_date,
+  1L, 0L)]
+trial_data[, if_cancer := fifelse(
+  !is.na(cancer_date) & cancer_date < trial_start_date,
+  1L, 0L)]
+trial_data[, if_alcohol := fifelse(
+  !is.na(alcohol_date) & alcohol_date < trial_start_date,
+  1L, 0L)]
+
+#Medication
+add_baseline_med <- function(trial_data,
+                             med_data,
+                             date_col,
+                             new_var,
+                             window_days = 365){
+  td <- copy(trial_data)
+  med <- copy(med_data)
+  setDT(td)
+  setDT(med)
+  td[, trial_id := .I]
+  td[, trial_start_date := as.Date(trial_start_date)]
+  med[, med_date := as.Date(get(date_col))]
+  trial_window <- td[, .(
+    trial_id,
+    patid,
+    window_start = trial_start_date - window_days,
+    window_end   = trial_start_date - 1
+  )]
+  med_flag <- med[
+    trial_window,
+    on = .(
+      patid,
+      med_date >= window_start,
+      med_date <= window_end
+    ),
+    nomatch = 0,
+    allow.cartesian = TRUE
+  ][,.(flag = 1L),by = trial_id]
+  td[, (new_var) := 0L]
+  td[
+    med_flag,
+    on = "trial_id",
+    (new_var) := i.flag]
+  td[, trial_id := NULL]
+  return(td)
+}
+
+# Antiplatelet
+trial_data <- add_baseline_med(
+  trial_data,
+  antip_pres,
+  "antip_date",
+  "if_antip")
+
+# Lipid-lowering
+trial_data <- add_baseline_med(
+  trial_data,
+  lipid_pres,
+  "lipid_date",
+  "if_lipid")
+
+# PPI
+trial_data <- add_baseline_med(
+  trial_data,
+  ppi_pres,
+  "ppi_date",
+  "if_ppi")
+
+# NSAID
+trial_data <- add_baseline_med(
+  trial_data,
+  nsaid_pres,
+  "nsaid_date",
+  "if_nsaid")
+
+# BETA
+trial_data <- add_baseline_med(
+  trial_data,
+  beta_pres,
+  "beta_date",
+  "if_beta")
+
+# RA
+trial_data <- add_baseline_med(
+  trial_data,
+  ra_pres,
+  "ra_date",
+  "if_ra")
+
+
+### PSM within each trial
+### 1:2 nearest-neighbor matching
+trial_data_model <- trial_data
+setDT(trial_data_model)
+# 1. Define matching variables
+match_vars <- c(
+  "age_at_AF", "gender", "ethnicity", "imd", "score1_factor","year_of_entry",
+  "if_ane", "if_ckd", "if_cpd", "if_dementia", "if_ld",  "if_cancer","if_alcohol",
+  "if_antip", "if_ppi", "if_nsaid", "if_lipid","if_beta","if_ra")
+
+factor_vars_psm <- c(
+  "gender", "ethnicity", "score1_factor",
+  "if_ane", "if_ckd", "if_cpd", "if_dementia", "if_ld",  "if_cancer","if_alcohol",
+  "if_antip", "if_ppi", "if_nsaid", "if_lipid","if_beta","if_ra")
+
+factor_vars_psm <- intersect(factor_vars_psm, names(trial_data_model))
+match_vars <- intersect(match_vars, names(trial_data_model))
+
+trial_data_model[, assigned_treat := as.integer(if_oac)]
+trial_data_model[, age_at_AF := as.numeric(as.character(age_at_AF))]
+trial_data_model[, imd := as.numeric(as.character(imd))]
+trial_data_model[, (factor_vars_psm) := lapply(.SD, as.factor), .SDcols = factor_vars_psm]
+
+psm_data <- trial_data_model[
+  complete.cases(trial_data_model[, ..match_vars]) &
+    !is.na(assigned_treat)]
+psm_data[, row_id_psm := .I]
+
+
+# 2. Function: match within one trial
+match_one_trial <- function(dt, ratio = 2) {
+  dt <- copy(dt)
+  thdeath_trial <- unique(dt$trial_num)
+  n_treat <- sum(dt$assigned_treat == 1, na.rm = TRUE)
+  n_control <- sum(dt$assigned_treat == 0, na.rm = TRUE)
+  if (n_treat == 0 | n_control == 0) {
+    return(list(
+      matched = NULL,
+      log = data.table(
+        trial_num = thdeath_trial,
+        n_treat = n_treat,
+        n_control = n_control,
+        matched_n = 0,
+        status = "Skipped: no treated or no control")))}
+  actual_ratio <- min(ratio, floor(n_control / n_treat))
+  if (actual_ratio < 1) {
+    return(list(
+      matched = NULL,
+      log = data.table(
+        trial_num = thdeath_trial,
+        n_treat = n_treat,
+        n_control = n_control,
+        matched_n = 0,
+        status = "Skipped: insufficient controls")))}
+  use_vars <- match_vars[
+    sapply(match_vars, function(v) {
+      length(unique(dt[[v]][!is.na(dt[[v]])])) > 1})]
+  if (length(use_vars) == 0) {
+    return(list(
+      matched = NULL,
+      log = data.table(
+        trial_num = thdeath_trial,
+        n_treat = n_treat,
+        n_control = n_control,
+        matched_n = 0,
+        status = "Skipped: no usable covariates")))}
+  
+  fml <- as.formula(
+    paste("assigned_treat ~", paste(use_vars, collapse = " + ")))
+  m <- tryCatch(
+    matchit(
+      formula = fml,
+      data = dt,
+      method = "nearest",
+      ratio = actual_ratio,
+      replace = FALSE,
+      distance = "glm",
+      caliper = 0.2
+    ),
+    error = function(e) e)
+  if (inherits(m, "error")) {
+    return(list(
+      matched = NULL,
+      log = data.table(
+        trial_num = thdeath_trial,
+        n_treat = n_treat,
+        n_control = n_control,
+        matched_n = 0,
+        status = paste0("Error: ", m$message))))}
+  matched <- as.data.table(match.data(m))
+  matched[, trial_num := thdeath_trial]
+  matched[, actual_ratio := actual_ratio]
+  return(list(
+    matched = matched,
+    log = data.table(
+      trial_num = thdeath_trial,
+      n_treat = n_treat,
+      n_control = n_control,
+      matched_n = nrow(matched),
+      status = paste0("Matched: 1:", actual_ratio))))}
+
+# 3. Run matching by trial
+psm_results <- psm_data[,
+                        {dt_one <- copy(.SD)
+                        dt_one[, trial_num := .BY$trial_num]
+                        res <- match_one_trial(dt_one, ratio = 2)
+                        .(matched = list(res$matched),
+                          log = list(res$log))},
+                        by = trial_num]
+
+matched_trial_data <- rbindlist(
+  psm_results$matched,
+  fill = TRUE)
+
+psm_log <- rbindlist(
+  psm_results$log,
+  fill = TRUE)
+
+# 4. Check matching results
+psm_log[, .N, by = status][order(status)]
+matched_trial_data[, .N, by = assigned_treat]
+matched_trial_data[
+  ,
+  .N,
+  by = .(trial_num, assigned_treat)
+][order(trial_num, assigned_treat)]
+
+
+cox_death_full <- coxph(
+  Surv(trial_followup_days, if_death == 1) ~ 
+    assigned_treat +
+    age_at_AF +gender + ethnicity + imd + score1_factor +year_of_entry+
+    if_ane + if_ckd + if_cpd + if_dementia + if_ld  + if_cancer + if_alcohol +
+    if_antip + if_ppi + if_nsaid + if_lipid + if_beta + if_ra +
+    cluster(patid),
+  data = matched_trial_data,
+  method = "efron")
+ShowRegTable(cox_death_full)
+
+
+
+
+#ib
+ib_cohort <- cohort_imp[,c("patid","gender","ethnicity","imd","age_at_AF","year_of_entry","alcohol_date",
+                           "ane_date","ckd_date","cpd_date","dementia_date","ld_date","cancer_date",
+                           "index_date","end_date1","ib_date","oac_date",
+                           "score1_factor","if_ib")]
+
+ib_cohort[, ib_end_date := fifelse(
+  !is.na(ib_date),
+  ib_date,
+  end_date1)]
+
+
+#step1: calculate total trial number for each participant
+setDT(ib_cohort)
+
+ib_cohort[, index_date := as.Date(index_date)]
+ib_cohort[, oac_date := as.Date(oac_date)]
+ib_cohort[, ib_end_date := as.Date(ib_end_date)]
+ib_cohort[, days_to_end := as.numeric(difftime(ib_end_date, index_date, units = "days"))]
+ib_cohort[, days_to_oac := as.numeric(difftime(oac_date, index_date, units = "days"))]
+
+ib_cohort[, total_trial_num := fifelse(
+  is.na(oac_date) | oac_date >= ib_end_date,
+  as.integer(floor(days_to_end / 30) + 1),
+  as.integer(floor(days_to_oac / 30) + 1))]
+#ib_cohort[, c("days_to_end", "days_to_oac") := NULL]
+table(ib_cohort$total_trial_num)
+#455
+
+
+#How many people in each trial
+trial_counts <- data.table(
+  trial_num = 1:max(ib_cohort$total_trial_num))
+
+trial_counts[, n := sapply(
+  trial_num,
+  function(i) sum(ib_cohort$total_trial_num >= i))]
+
+print(trial_counts, nrows = Inf)
+#1000, 142
+
+
+# Restrict the sequential trials to a maximum of 142
+ib_cohort[, total_trial_num := pmin(total_trial_num, 142L)]
+
+# Check the updated dibtribution
+table(ib_cohort$total_trial_num)
+
+# Recalculate the number of participants in each trial
+trial_counts_142 <- data.table(
+  trial_num = 1:142)
+
+trial_counts_142[, n := sapply(
+  trial_num,
+  function(i) sum(ib_cohort$total_trial_num >= i))]
+
+print(trial_counts_142, nrows = Inf)
+
+
+
+#step2: Define the start and end date of each trial for each participant, if_IS, and followup days for each trial
+trial_data <- ib_cohort[
+  rep(seq_len(nrow(ib_cohort)), total_trial_num)]
+trial_data[, trial_num := seq_len(.N), by = patid]
+table(trial_data$trial_num)
+
+trial_data[, trial_start_date := index_date + (trial_num - 1) * 30]
+
+trial_data[, trial_end_date := pmin(
+  index_date + trial_num * 30 - 1,
+  ib_end_date)]
+
+trial_data[, .(
+  patid,
+  index_date,
+  ib_end_date,
+  total_trial_num,
+  trial_num,
+  trial_start_date,
+  trial_end_date)]
+
+#trial followup days
+trial_data[, trial_followup_days := as.numeric(
+  difftime(ib_end_date, trial_start_date, units = "days")) + 1]
+
+
+#step3: define each participant's OAC and time-dependent variable happens in which trial
+#Before that trial: 0;  after that trial: 1
+#OAC
+trial_data[, if_oac := fifelse(
+  !is.na(oac_date) &
+    oac_date >= trial_start_date &
+    oac_date <= trial_end_date,
+  1L, 0L)]
+
+trial_data[, .(n_oac_trial = sum(if_oac)), by = patid][
+  n_oac_trial > 1]
+trial_data[if_oac == 1 & trial_num != total_trial_num]
+
+#Time-dependent covariates
+#comorbidities
+trial_data[, if_ane := fifelse(
+  !is.na(ane_date) & ane_date < trial_start_date,
+  1L, 0L)]
+trial_data[, if_ckd := fifelse(
+  !is.na(ckd_date) & ckd_date < trial_start_date,
+  1L, 0L)]
+trial_data[, if_cpd := fifelse(
+  !is.na(cpd_date) & cpd_date < trial_start_date,
+  1L, 0L)]
+trial_data[, if_dementia := fifelse(
+  !is.na(dementia_date) & dementia_date < trial_start_date,
+  1L, 0L)]
+trial_data[, if_ld := fifelse(
+  !is.na(ld_date) & ld_date < trial_start_date,
+  1L, 0L)]
+trial_data[, if_cancer := fifelse(
+  !is.na(cancer_date) & cancer_date < trial_start_date,
+  1L, 0L)]
+trial_data[, if_alcohol := fifelse(
+  !is.na(alcohol_date) & alcohol_date < trial_start_date,
+  1L, 0L)]
+
+#Medication
+add_baseline_med <- function(trial_data,
+                             med_data,
+                             date_col,
+                             new_var,
+                             window_days = 365){
+  td <- copy(trial_data)
+  med <- copy(med_data)
+  setDT(td)
+  setDT(med)
+  td[, trial_id := .I]
+  td[, trial_start_date := as.Date(trial_start_date)]
+  med[, med_date := as.Date(get(date_col))]
+  trial_window <- td[, .(
+    trial_id,
+    patid,
+    window_start = trial_start_date - window_days,
+    window_end   = trial_start_date - 1
+  )]
+  med_flag <- med[
+    trial_window,
+    on = .(
+      patid,
+      med_date >= window_start,
+      med_date <= window_end
+    ),
+    nomatch = 0,
+    allow.cartesian = TRUE
+  ][,.(flag = 1L),by = trial_id]
+  td[, (new_var) := 0L]
+  td[
+    med_flag,
+    on = "trial_id",
+    (new_var) := i.flag]
+  td[, trial_id := NULL]
+  return(td)
+}
+
+# Antiplatelet
+trial_data <- add_baseline_med(
+  trial_data,
+  antip_pres,
+  "antip_date",
+  "if_antip")
+
+# Lipid-lowering
+trial_data <- add_baseline_med(
+  trial_data,
+  lipid_pres,
+  "lipid_date",
+  "if_lipid")
+
+# PPI
+trial_data <- add_baseline_med(
+  trial_data,
+  ppi_pres,
+  "ppi_date",
+  "if_ppi")
+
+# NSAID
+trial_data <- add_baseline_med(
+  trial_data,
+  nsaid_pres,
+  "nsaid_date",
+  "if_nsaid")
+
+# BETA
+trial_data <- add_baseline_med(
+  trial_data,
+  beta_pres,
+  "beta_date",
+  "if_beta")
+
+# RA
+trial_data <- add_baseline_med(
+  trial_data,
+  ra_pres,
+  "ra_date",
+  "if_ra")
+
+
+### PSM within each trial
+### 1:2 nearest-neighbor matching
+trial_data_model <- trial_data
+setDT(trial_data_model)
+# 1. Define matching variables
+match_vars <- c(
+  "age_at_AF", "gender", "ethnicity", "imd", "score1_factor","year_of_entry",
+  "if_ane", "if_ckd", "if_cpd", "if_dementia", "if_ld",  "if_cancer","if_alcohol",
+  "if_antip", "if_ppi", "if_nsaid", "if_lipid","if_beta","if_ra")
+
+factor_vars_psm <- c(
+  "gender", "ethnicity", "score1_factor",
+  "if_ane", "if_ckd", "if_cpd", "if_dementia", "if_ld",  "if_cancer","if_alcohol",
+  "if_antip", "if_ppi", "if_nsaid", "if_lipid","if_beta","if_ra")
+
+factor_vars_psm <- intersect(factor_vars_psm, names(trial_data_model))
+match_vars <- intersect(match_vars, names(trial_data_model))
+
+trial_data_model[, assigned_treat := as.integer(if_oac)]
+trial_data_model[, age_at_AF := as.numeric(as.character(age_at_AF))]
+trial_data_model[, imd := as.numeric(as.character(imd))]
+trial_data_model[, (factor_vars_psm) := lapply(.SD, as.factor), .SDcols = factor_vars_psm]
+
+psm_data <- trial_data_model[
+  complete.cases(trial_data_model[, ..match_vars]) &
+    !is.na(assigned_treat)]
+psm_data[, row_id_psm := .I]
+
+
+# 2. Function: match within one trial
+match_one_trial <- function(dt, ratio = 2) {
+  dt <- copy(dt)
+  thib_trial <- unique(dt$trial_num)
+  n_treat <- sum(dt$assigned_treat == 1, na.rm = TRUE)
+  n_control <- sum(dt$assigned_treat == 0, na.rm = TRUE)
+  if (n_treat == 0 | n_control == 0) {
+    return(list(
+      matched = NULL,
+      log = data.table(
+        trial_num = thib_trial,
+        n_treat = n_treat,
+        n_control = n_control,
+        matched_n = 0,
+        status = "Skipped: no treated or no control")))}
+  actual_ratio <- min(ratio, floor(n_control / n_treat))
+  if (actual_ratio < 1) {
+    return(list(
+      matched = NULL,
+      log = data.table(
+        trial_num = thib_trial,
+        n_treat = n_treat,
+        n_control = n_control,
+        matched_n = 0,
+        status = "Skipped: insufficient controls")))}
+  use_vars <- match_vars[
+    sapply(match_vars, function(v) {
+      length(unique(dt[[v]][!is.na(dt[[v]])])) > 1})]
+  if (length(use_vars) == 0) {
+    return(list(
+      matched = NULL,
+      log = data.table(
+        trial_num = thib_trial,
+        n_treat = n_treat,
+        n_control = n_control,
+        matched_n = 0,
+        status = "Skipped: no usable covariates")))}
+  
+  fml <- as.formula(
+    paste("assigned_treat ~", paste(use_vars, collapse = " + ")))
+  m <- tryCatch(
+    matchit(
+      formula = fml,
+      data = dt,
+      method = "nearest",
+      ratio = actual_ratio,
+      replace = FALSE,
+      distance = "glm",
+      caliper = 0.2
+    ),
+    error = function(e) e)
+  if (inherits(m, "error")) {
+    return(list(
+      matched = NULL,
+      log = data.table(
+        trial_num = thib_trial,
+        n_treat = n_treat,
+        n_control = n_control,
+        matched_n = 0,
+        status = paste0("Error: ", m$message))))}
+  matched <- as.data.table(match.data(m))
+  matched[, trial_num := thib_trial]
+  matched[, actual_ratio := actual_ratio]
+  return(list(
+    matched = matched,
+    log = data.table(
+      trial_num = thib_trial,
+      n_treat = n_treat,
+      n_control = n_control,
+      matched_n = nrow(matched),
+      status = paste0("Matched: 1:", actual_ratio))))}
+
+# 3. Run matching by trial
+psm_results <- psm_data[,
+                        {dt_one <- copy(.SD)
+                        dt_one[, trial_num := .BY$trial_num]
+                        res <- match_one_trial(dt_one, ratio = 2)
+                        .(matched = list(res$matched),
+                          log = list(res$log))},
+                        by = trial_num]
+
+matched_trial_data <- rbindlist(
+  psm_results$matched,
+  fill = TRUE)
+
+psm_log <- rbindlist(
+  psm_results$log,
+  fill = TRUE)
+
+# 4. Check matching results
+psm_log[, .N, by = status][order(status)]
+matched_trial_data[, .N, by = assigned_treat]
+matched_trial_data[
+  ,
+  .N,
+  by = .(trial_num, assigned_treat)
+][order(trial_num, assigned_treat)]
+
+
+#Summary
+matched_trial_summary <- matched_trial_data[,.(
+  total_n = .N,
+  if_oac_1 = sum(if_oac == 1L, na.rm = TRUE),
+  if_oac_0 = sum(if_oac == 0L, na.rm = TRUE)),
+  by = trial_num][order(trial_num)]
+print(matched_trial_summary, nrows = Inf)
+all_trials <- data.table(
+  trial_num = 1:142)
+matched_trial_summary_full <- merge(
+  all_trials,
+  matched_trial_summary,
+  by = "trial_num",
+  all.x = TRUE)
+matched_trial_summary_full[
+  is.na(total_n),
+  `:=`(total_n = 0L,
+       if_oac_1 = 0L,
+       if_oac_0 = 0L)]
+print(matched_trial_summary_full,
+      nrows = Inf)
+
+
+cox_ib_full <- coxph(
+  Surv(trial_followup_days, if_ib == 1) ~ 
+    assigned_treat +
+    age_at_AF +gender + ethnicity + imd + score1_factor +year_of_entry+
+    if_ane + if_ckd + if_cpd + if_dementia + if_ld  + if_cancer + if_alcohol +
+    if_antip + if_ppi + if_nsaid + if_lipid + if_beta + if_ra +
+    cluster(patid),
+  data = matched_trial_data,
+  method = "efron")
+ShowRegTable(cox_ib_full)
+
+
+
+bal.tab(
+  assigned_treat ~ age_at_AF + gender + ethnicity + imd + score1_factor +year_of_entry+
+    if_ane + if_ckd + if_cpd + if_dementia + if_ld + if_cancer + if_alcohol+
+    if_antip + if_ppi + if_nsaid + if_lipid+if_beta+if_ra,
+  data = matched_trial_data,
+  weights = trial_data_iptw$weights*trial_data_iptw$IPTW_trunc)
+#none
+
+#Covariate balance plot
+#7*7
+setDT(psm_data)
+setDT(trial_data_iptw)
+stopifnot(
+  "row_id_psm" %in% names(psm_data),
+  "row_id_psm" %in% names(trial_data_iptw),
+  "weights" %in% names(trial_data_iptw))
+
+balance_data <- copy(psm_data)
+balance_data[, psm_weight := 0]
+matched_weights <- trial_data_iptw[
+  ,
+  .(
+    psm_weight = sum(weights, na.rm = TRUE)
+  ),
+  by = row_id_psm]
+
+balance_data[
+  matched_weights,
+  on = "row_id_psm",
+  psm_weight := i.psm_weight]
+
+balance_data[,
+             .(
+               before_matching = .N,
+               after_matching = sum(psm_weight > 0),
+               total_matching_weight = sum(psm_weight))]
+
+balance_data[
+  psm_weight > 0,
+  .(
+    N = .N,
+    weighted_N = sum(psm_weight)
+  ),
+  by = assigned_treat]
+
+balance_data[, ethnicity := as.character(ethnicity)]
+
+ethnicity_map <- c(
+  "0" = "White",
+  "1" = "Non-white")
+
+balance_data[
+  ,
+  ethnicity := factor(
+    ethnicity,
+    levels = names(ethnicity_map),
+    labels = unname(ethnicity_map))]
+
+table(balance_data$ethnicity, useNA = "ifany")
+
+balance_data[, score1_factor := as.character(score1_factor)]
+score_factor_map <- c(
+  "age65" = "Age 65 to 74 years",
+  "dm"    = "Diabetes mellitus",
+  "hf"    = "Heart failure",
+  "hpt"   = "Hypertension",
+  "vd"    = "Vascular disease")
+
+unknown_score_factor <- setdiff(
+  unique(na.omit(balance_data$score1_factor)),
+  names(score_factor_map))
+
+if (length(unknown_score_factor) > 0) {
+  warning(
+    "The following score1_factor levels were not included in score_factor_map: ",
+    paste(unknown_score_factor, collapse = ", "))}
+
+balance_data[
+  ,
+  score1_factor := factor(
+    score1_factor,
+    levels = names(score_factor_map),
+    labels = unname(score_factor_map))]
+
+table(balance_data$score1_factor, useNA = "ifany")
+
+balance_data[, assigned_treat := as.integer(assigned_treat)]
+balance_data[, age_at_AF := as.numeric(as.character(age_at_AF))]
+balance_data[, imd := as.numeric(as.character(imd))]
+
+binary_factor_vars <- c(
+  "gender",
+  "if_ane",
+  "if_ckd",
+  "if_cpd",
+  "if_dementia",
+  "if_ld",
+  "if_cancer",
+  "if_alcohol",
+  "if_antip",
+  "if_ppi",
+  "if_nsaid",
+  "if_lipid",
+  "if_beta",
+  "if_rd")
+
+binary_factor_vars <- intersect(
+  binary_factor_vars,
+  names(balance_data))
+
+balance_data[
+  ,
+  (binary_factor_vars) := lapply(.SD, as.factor),
+  .SDcols = binary_factor_vars]
+
+balance_formula <- assigned_treat ~
+  age_at_AF +
+  gender +
+  ethnicity +
+  imd +
+  score1_factor +
+  year_of_entry +
+  
+  if_ane +
+  if_ckd +
+  if_cpd +
+  if_dementia +
+  if_ld +
+  if_cancer +
+  if_alcohol +
+  if_antip +
+  if_ppi +
+  if_nsaid +
+  if_lipid +
+  if_beta +
+  if_ra
+
+balance_result <- bal.tab(
+  balance_formula,
+  data = balance_data,
+  weights = balance_data$psm_weight,
+  un = TRUE,
+  s.d.denom = "pooled",
+  binary = "std",
+  thresholds = c(m = 0.1))
+
+print(balance_result)
+
+balance_names <- rownames(balance_result$Balance)
+pretty_names <- balance_names
+
+pretty_names[balance_names == "age_at_AF"] <-
+  "Age (years)"
+
+pretty_names[balance_names == "imd"] <-
+  "Index of Multiple Deprivation"
+
+pretty_names <- gsub(
+  "^gender_.*$",
+  "Gender",
+  pretty_names)
+
+pretty_names <- gsub(
+  "^ethnicity_",
+  "Ethnicity: ",
+  pretty_names)
+
+pretty_names[balance_names == "year_of_entry"] <-
+  "Year of entry"
+
+pretty_names <- gsub(
+  "^score1_factor_",
+  "CHA2DS2-VASc factor: ",
+  pretty_names)
+
+pretty_names <- gsub(
+  "^if_ane(_1)?$",
+  "Anemia",
+  pretty_names)
+
+pretty_names <- gsub(
+  "^if_ckd(_1)?$",
+  "Renal disease",
+  pretty_names)
+
+pretty_names <- gsub(
+  "^if_cpd(_1)?$",
+  "Chronic respiratory disease",
+  pretty_names)
+
+pretty_names <- gsub(
+  "^if_dementia(_1)?$",
+  "Dementia",
+  pretty_names)
+
+pretty_names <- gsub(
+  "^if_ld(_1)?$",
+  "Liver disease",
+  pretty_names)
+
+pretty_names <- gsub(
+  "^if_cancer(_1)?$",
+  "Cancer",
+  pretty_names)
+
+pretty_names <- gsub(
+  "^if_alcohol(_1)?$",
+  "Alcohol misuse",
+  pretty_names)
+
+
+pretty_names <- gsub(
+  "^if_antip(_1)?$",
+  "Antiplatelet use",
+  pretty_names)
+
+pretty_names <- gsub(
+  "^if_ppi(_1)?$",
+  "PPI use",
+  pretty_names)
+
+pretty_names <- gsub(
+  "^if_nsaid(_1)?$",
+  "NSAID use",
+  pretty_names)
+
+pretty_names <- gsub(
+  "^if_lipid(_1)?$",
+  "Lipid-lowering therapy",
+  pretty_names)
+
+pretty_names <- gsub(
+  "^if_beta(_1)?$",
+  "Beta blocking agents",
+  pretty_names)
+
+pretty_names <- gsub(
+  "^if_ra(_1)?$",
+  "Renin-Angiotensin system drug",
+  pretty_names)
+
+
+
+variable_labels <- setNames(
+  pretty_names,
+  balance_names)
+
+data.table(
+  original_name = balance_names,
+  displayed_name = pretty_names)
+p_balance <- love.plot(
+  balance_result,
+  stats = "mean.diffs",
+  abs = TRUE,
+  thresholds = c(m = 0.1),
+  var.order = "unadjusted",
+  sample.names = c(
+    "Before matching",
+    "After matching"),
+  colors = c(
+    "#c63d48",
+    "#4264a4"),
+  shapes = c(
+    16,
+    17),
+  line = FALSE,
+  size = 3,
+  var.names = variable_labels) +
+  labs(
+    title = "Intracranial hemorrhage analysis",
+    x = "Absolute Standardized Mean Difference",
+    y = NULL) +
+  theme_bw(base_size = 11) +
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,
+      face = "bold",
+      size = 14),
+    legend.position = "top",
+    legend.title = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.y = element_line(
+      linewidth = 0.3,
+      colour = "grey90"),
+    panel.grid.major.x = element_line(
+      linewidth = 0.3,
+      colour = "grey85"),
+    axis.text.y = element_text(
+      size = 8.5,
+      colour = "black"),
+    axis.text.x = element_text(
+      size = 10,
+      colour = "black"),
+    axis.title.x = element_text(
+      face = "bold",
+      size = 11),
+    plot.margin = margin(
+      t = 5,
+      r = 15,
+      b = 5,
+      l = 25))
+p_balance
+
+
+
+
+
+
+
+#gib
+gib_cohort <- cohort_imp[,c("patid","gender","ethnicity","imd","age_at_AF","year_of_entry","alcohol_date",
+                            "ane_date","ckd_date","cpd_date","dementia_date","ld_date","cancer_date",
+                            "index_date","end_date1","gib_date","oac_date",
+                            "score1_factor","if_gib")]
+
+gib_cohort[, gib_end_date := fifelse(
+  !is.na(gib_date),
+  gib_date,
+  end_date1)]
+
+
+#step1: calculate total trial number for each participant
+setDT(gib_cohort)
+
+gib_cohort[, index_date := as.Date(index_date)]
+gib_cohort[, oac_date := as.Date(oac_date)]
+gib_cohort[, gib_end_date := as.Date(gib_end_date)]
+gib_cohort[, days_to_end := as.numeric(difftime(gib_end_date, index_date, units = "days"))]
+gib_cohort[, days_to_oac := as.numeric(difftime(oac_date, index_date, units = "days"))]
+
+gib_cohort[, total_trial_num := fifelse(
+  is.na(oac_date) | oac_date >= gib_end_date,
+  as.integer(floor(days_to_end / 30) + 1),
+  as.integer(floor(days_to_oac / 30) + 1))]
+#gib_cohort[, c("days_to_end", "days_to_oac") := NULL]
+table(gib_cohort$total_trial_num)
+
+
+#How many people in each trial
+trial_counts <- data.table(
+  trial_num = 1:max(gib_cohort$total_trial_num))
+
+trial_counts[, n := sapply(
+  trial_num,
+  function(i) sum(gib_cohort$total_trial_num >= i))]
+
+print(trial_counts, nrows = Inf)
+
+
+# Restrict the sequential trials to a maximum of 142
+gib_cohort[, total_trial_num := pmin(total_trial_num, 142L)]
+
+# Check the updated dgibtrgibution
+table(gib_cohort$total_trial_num)
+
+# Recalculate the number of participants in each trial
+trial_counts_142 <- data.table(
+  trial_num = 1:142)
+
+trial_counts_142[, n := sapply(
+  trial_num,
+  function(i) sum(gib_cohort$total_trial_num >= i))]
+
+print(trial_counts_142, nrows = Inf)
+
+
+
+#step2: Define the start and end date of each trial for each participant, if_IS, and followup days for each trial
+trial_data <- gib_cohort[
+  rep(seq_len(nrow(gib_cohort)), total_trial_num)]
+trial_data[, trial_num := seq_len(.N), by = patid]
+table(trial_data$trial_num)
+
+trial_data[, trial_start_date := index_date + (trial_num - 1) * 30]
+
+trial_data[, trial_end_date := pmin(
+  index_date + trial_num * 30 - 1,
+  gib_end_date)]
+
+trial_data[, .(
+  patid,
+  index_date,
+  gib_end_date,
+  total_trial_num,
+  trial_num,
+  trial_start_date,
+  trial_end_date)]
+
+#trial followup days
+trial_data[, trial_followup_days := as.numeric(
+  difftime(gib_end_date, trial_start_date, units = "days")) + 1]
+
+
+#step3: define each participant's OAC and time-dependent variable happens in which trial
+#Before that trial: 0;  after that trial: 1
+#OAC
+trial_data[, if_oac := fifelse(
+  !is.na(oac_date) &
+    oac_date >= trial_start_date &
+    oac_date <= trial_end_date,
+  1L, 0L)]
+
+trial_data[, .(n_oac_trial = sum(if_oac)), by = patid][
+  n_oac_trial > 1]
+trial_data[if_oac == 1 & trial_num != total_trial_num]
+
+#Time-dependent covariates
+#comorbidities
+trial_data[, if_ane := fifelse(
+  !is.na(ane_date) & ane_date < trial_start_date,
+  1L, 0L)]
+trial_data[, if_ckd := fifelse(
+  !is.na(ckd_date) & ckd_date < trial_start_date,
+  1L, 0L)]
+trial_data[, if_cpd := fifelse(
+  !is.na(cpd_date) & cpd_date < trial_start_date,
+  1L, 0L)]
+trial_data[, if_dementia := fifelse(
+  !is.na(dementia_date) & dementia_date < trial_start_date,
+  1L, 0L)]
+trial_data[, if_ld := fifelse(
+  !is.na(ld_date) & ld_date < trial_start_date,
+  1L, 0L)]
+trial_data[, if_cancer := fifelse(
+  !is.na(cancer_date) & cancer_date < trial_start_date,
+  1L, 0L)]
+trial_data[, if_alcohol := fifelse(
+  !is.na(alcohol_date) & alcohol_date < trial_start_date,
+  1L, 0L)]
+
+#Medication
+add_baseline_med <- function(trial_data,
+                             med_data,
+                             date_col,
+                             new_var,
+                             window_days = 365){
+  td <- copy(trial_data)
+  med <- copy(med_data)
+  setDT(td)
+  setDT(med)
+  td[, trial_id := .I]
+  td[, trial_start_date := as.Date(trial_start_date)]
+  med[, med_date := as.Date(get(date_col))]
+  trial_window <- td[, .(
+    trial_id,
+    patid,
+    window_start = trial_start_date - window_days,
+    window_end   = trial_start_date - 1
+  )]
+  med_flag <- med[
+    trial_window,
+    on = .(
+      patid,
+      med_date >= window_start,
+      med_date <= window_end
+    ),
+    nomatch = 0,
+    allow.cartesian = TRUE
+  ][,.(flag = 1L),by = trial_id]
+  td[, (new_var) := 0L]
+  td[
+    med_flag,
+    on = "trial_id",
+    (new_var) := i.flag]
+  td[, trial_id := NULL]
+  return(td)
+}
+
+# Antiplatelet
+trial_data <- add_baseline_med(
+  trial_data,
+  antip_pres,
+  "antip_date",
+  "if_antip")
+
+# Lipid-lowering
+trial_data <- add_baseline_med(
+  trial_data,
+  lipid_pres,
+  "lipid_date",
+  "if_lipid")
+
+# PPI
+trial_data <- add_baseline_med(
+  trial_data,
+  ppi_pres,
+  "ppi_date",
+  "if_ppi")
+
+# NSAID
+trial_data <- add_baseline_med(
+  trial_data,
+  nsaid_pres,
+  "nsaid_date",
+  "if_nsaid")
+
+# BETA
+trial_data <- add_baseline_med(
+  trial_data,
+  beta_pres,
+  "beta_date",
+  "if_beta")
+
+# RA
+trial_data <- add_baseline_med(
+  trial_data,
+  ra_pres,
+  "ra_date",
+  "if_ra")
+
+
+### PSM within each trial
+### 1:2 nearest-neighbor matching
+trial_data_model <- trial_data
+setDT(trial_data_model)
+# 1. Define matching variables
+match_vars <- c(
+  "age_at_AF", "gender", "ethnicity", "imd", "score1_factor","year_of_entry",
+  "if_ane", "if_ckd", "if_cpd", "if_dementia", "if_ld",  "if_cancer","if_alcohol",
+  "if_antip", "if_ppi", "if_nsaid", "if_lipid","if_beta","if_ra")
+
+factor_vars_psm <- c(
+  "gender", "ethnicity", "score1_factor",
+  "if_ane", "if_ckd", "if_cpd", "if_dementia", "if_ld",  "if_cancer","if_alcohol",
+  "if_antip", "if_ppi", "if_nsaid", "if_lipid","if_beta","if_ra")
+
+factor_vars_psm <- intersect(factor_vars_psm, names(trial_data_model))
+match_vars <- intersect(match_vars, names(trial_data_model))
+
+trial_data_model[, assigned_treat := as.integer(if_oac)]
+trial_data_model[, age_at_AF := as.numeric(as.character(age_at_AF))]
+trial_data_model[, imd := as.numeric(as.character(imd))]
+trial_data_model[, (factor_vars_psm) := lapply(.SD, as.factor), .SDcols = factor_vars_psm]
+
+psm_data <- trial_data_model[
+  complete.cases(trial_data_model[, ..match_vars]) &
+    !is.na(assigned_treat)]
+psm_data[, row_id_psm := .I]
+
+
+# 2. Function: match within one trial
+match_one_trial <- function(dt, ratio = 2) {
+  dt <- copy(dt)
+  thgib_trial <- unique(dt$trial_num)
+  n_treat <- sum(dt$assigned_treat == 1, na.rm = TRUE)
+  n_control <- sum(dt$assigned_treat == 0, na.rm = TRUE)
+  if (n_treat == 0 | n_control == 0) {
+    return(list(
+      matched = NULL,
+      log = data.table(
+        trial_num = thgib_trial,
+        n_treat = n_treat,
+        n_control = n_control,
+        matched_n = 0,
+        status = "Skipped: no treated or no control")))}
+  actual_ratio <- min(ratio, floor(n_control / n_treat))
+  if (actual_ratio < 1) {
+    return(list(
+      matched = NULL,
+      log = data.table(
+        trial_num = thgib_trial,
+        n_treat = n_treat,
+        n_control = n_control,
+        matched_n = 0,
+        status = "Skipped: insufficient controls")))}
+  use_vars <- match_vars[
+    sapply(match_vars, function(v) {
+      length(unique(dt[[v]][!is.na(dt[[v]])])) > 1})]
+  if (length(use_vars) == 0) {
+    return(list(
+      matched = NULL,
+      log = data.table(
+        trial_num = thgib_trial,
+        n_treat = n_treat,
+        n_control = n_control,
+        matched_n = 0,
+        status = "Skipped: no usable covariates")))}
+  
+  fml <- as.formula(
+    paste("assigned_treat ~", paste(use_vars, collapse = " + ")))
+  m <- tryCatch(
+    matchit(
+      formula = fml,
+      data = dt,
+      method = "nearest",
+      ratio = actual_ratio,
+      replace = FALSE,
+      distance = "glm",
+      caliper = 0.2
+    ),
+    error = function(e) e)
+  if (inherits(m, "error")) {
+    return(list(
+      matched = NULL,
+      log = data.table(
+        trial_num = thgib_trial,
+        n_treat = n_treat,
+        n_control = n_control,
+        matched_n = 0,
+        status = paste0("Error: ", m$message))))}
+  matched <- as.data.table(match.data(m))
+  matched[, trial_num := thgib_trial]
+  matched[, actual_ratio := actual_ratio]
+  return(list(
+    matched = matched,
+    log = data.table(
+      trial_num = thgib_trial,
+      n_treat = n_treat,
+      n_control = n_control,
+      matched_n = nrow(matched),
+      status = paste0("Matched: 1:", actual_ratio))))}
+
+# 3. Run matching by trial
+psm_results <- psm_data[,
+                        {dt_one <- copy(.SD)
+                        dt_one[, trial_num := .BY$trial_num]
+                        res <- match_one_trial(dt_one, ratio = 2)
+                        .(matched = list(res$matched),
+                          log = list(res$log))},
+                        by = trial_num]
+
+matched_trial_data <- rbindlist(
+  psm_results$matched,
+  fill = TRUE)
+
+#Summary
+matched_trial_summary <- matched_trial_data[,.(
+  total_n = .N,
+  if_oac_1 = sum(if_oac == 1L, na.rm = TRUE),
+  if_oac_0 = sum(if_oac == 0L, na.rm = TRUE)),
+  by = trial_num][order(trial_num)]
+print(matched_trial_summary, nrows = Inf)
+all_trials <- data.table(
+  trial_num = 1:142)
+matched_trial_summary_full <- merge(
+  all_trials,
+  matched_trial_summary,
+  by = "trial_num",
+  all.x = TRUE)
+matched_trial_summary_full[
+  is.na(total_n),
+  `:=`(total_n = 0L,
+       if_oac_1 = 0L,
+       if_oac_0 = 0L)]
+print(matched_trial_summary_full,
+      nrows = Inf)
+
+
+
+cox_gib_full <- coxph(
+  Surv(trial_followup_days, if_gib == 1) ~ 
+    assigned_treat +
+    age_at_AF +gender + ethnicity + imd + score1_factor +year_of_entry+
+    if_ane + if_ckd + if_cpd + if_dementia + if_ld  + if_cancer + if_alcohol +
+    if_antip + if_ppi + if_nsaid + if_lipid + if_beta + if_ra +
+    cluster(patid),
+  data = matched_trial_data,
+  method = "efron")
+ShowRegTable(cox_gib_full)
+
+
+
+bal.tab(
+  assigned_treat ~ age_at_AF + gender + ethnicity + imd + score1_factor +year_of_entry+
+    if_ane + if_ckd + if_cpd + if_dementia + if_ld + if_cancer + if_alcohol+
+    if_antip + if_ppi + if_nsaid + if_lipid+if_beta+if_ra,
+  data = matched_trial_data,
+  weights = trial_data_iptw$weights*trial_data_iptw$IPTW_trunc)
+#none
+
+#Covariate balance plot
+#7*7
+setDT(psm_data)
+setDT(trial_data_iptw)
+stopifnot(
+  "row_id_psm" %in% names(psm_data),
+  "row_id_psm" %in% names(trial_data_iptw),
+  "weights" %in% names(trial_data_iptw))
+
+balance_data <- copy(psm_data)
+balance_data[, psm_weight := 0]
+matched_weights <- trial_data_iptw[
+  ,
+  .(
+    psm_weight = sum(weights, na.rm = TRUE)
+  ),
+  by = row_id_psm]
+
+balance_data[
+  matched_weights,
+  on = "row_id_psm",
+  psm_weight := i.psm_weight]
+
+balance_data[,
+             .(
+               before_matching = .N,
+               after_matching = sum(psm_weight > 0),
+               total_matching_weight = sum(psm_weight))]
+
+balance_data[
+  psm_weight > 0,
+  .(
+    N = .N,
+    weighted_N = sum(psm_weight)
+  ),
+  by = assigned_treat]
+
+balance_data[, ethnicity := as.character(ethnicity)]
+
+ethnicity_map <- c(
+  "0" = "White",
+  "1" = "Non-white")
+
+balance_data[
+  ,
+  ethnicity := factor(
+    ethnicity,
+    levels = names(ethnicity_map),
+    labels = unname(ethnicity_map))]
+
+table(balance_data$ethnicity, useNA = "ifany")
+
+balance_data[, score1_factor := as.character(score1_factor)]
+score_factor_map <- c(
+  "age65" = "Age 65 to 74 years",
+  "dm"    = "Diabetes mellitus",
+  "hf"    = "Heart failure",
+  "hpt"   = "Hypertension",
+  "vd"    = "Vascular disease")
+
+unknown_score_factor <- setdiff(
+  unique(na.omit(balance_data$score1_factor)),
+  names(score_factor_map))
+
+if (length(unknown_score_factor) > 0) {
+  warning(
+    "The following score1_factor levels were not included in score_factor_map: ",
+    paste(unknown_score_factor, collapse = ", "))}
+
+balance_data[
+  ,
+  score1_factor := factor(
+    score1_factor,
+    levels = names(score_factor_map),
+    labels = unname(score_factor_map))]
+
+table(balance_data$score1_factor, useNA = "ifany")
+
+balance_data[, assigned_treat := as.integer(assigned_treat)]
+balance_data[, age_at_AF := as.numeric(as.character(age_at_AF))]
+balance_data[, imd := as.numeric(as.character(imd))]
+
+binary_factor_vars <- c(
+  "gender",
+  "if_ane",
+  "if_ckd",
+  "if_cpd",
+  "if_dementia",
+  "if_ld",
+  "if_cancer",
+  "if_alcohol",
+  "if_antip",
+  "if_ppi",
+  "if_nsaid",
+  "if_lipid",
+  "if_beta",
+  "if_rd")
+
+binary_factor_vars <- intersect(
+  binary_factor_vars,
+  names(balance_data))
+
+balance_data[
+  ,
+  (binary_factor_vars) := lapply(.SD, as.factor),
+  .SDcols = binary_factor_vars]
+
+balance_formula <- assigned_treat ~
+  age_at_AF +
+  gender +
+  ethnicity +
+  imd +
+  score1_factor +
+  year_of_entry +
+  
+  if_ane +
+  if_ckd +
+  if_cpd +
+  if_dementia +
+  if_ld +
+  if_cancer +
+  if_alcohol +
+  if_antip +
+  if_ppi +
+  if_nsaid +
+  if_lipid +
+  if_beta +
+  if_ra
+
+balance_result <- bal.tab(
+  balance_formula,
+  data = balance_data,
+  weights = balance_data$psm_weight,
+  un = TRUE,
+  s.d.denom = "pooled",
+  binary = "std",
+  thresholds = c(m = 0.1))
+
+print(balance_result)
+
+balance_names <- rownames(balance_result$Balance)
+pretty_names <- balance_names
+
+pretty_names[balance_names == "age_at_AF"] <-
+  "Age (years)"
+
+pretty_names[balance_names == "imd"] <-
+  "Index of Multiple Deprivation"
+
+pretty_names <- gsub(
+  "^gender_.*$",
+  "Gender",
+  pretty_names)
+
+pretty_names <- gsub(
+  "^ethnicity_",
+  "Ethnicity: ",
+  pretty_names)
+
+pretty_names[balance_names == "year_of_entry"] <-
+  "Year of entry"
+
+pretty_names <- gsub(
+  "^score1_factor_",
+  "CHA2DS2-VASc factor: ",
+  pretty_names)
+
+pretty_names <- gsub(
+  "^if_ane(_1)?$",
+  "Anemia",
+  pretty_names)
+
+pretty_names <- gsub(
+  "^if_ckd(_1)?$",
+  "Renal disease",
+  pretty_names)
+
+pretty_names <- gsub(
+  "^if_cpd(_1)?$",
+  "Chronic respiratory disease",
+  pretty_names)
+
+pretty_names <- gsub(
+  "^if_dementia(_1)?$",
+  "Dementia",
+  pretty_names)
+
+pretty_names <- gsub(
+  "^if_ld(_1)?$",
+  "Liver disease",
+  pretty_names)
+
+pretty_names <- gsub(
+  "^if_cancer(_1)?$",
+  "Cancer",
+  pretty_names)
+
+pretty_names <- gsub(
+  "^if_alcohol(_1)?$",
+  "Alcohol misuse",
+  pretty_names)
+
+
+pretty_names <- gsub(
+  "^if_antip(_1)?$",
+  "Antiplatelet use",
+  pretty_names)
+
+pretty_names <- gsub(
+  "^if_ppi(_1)?$",
+  "PPI use",
+  pretty_names)
+
+pretty_names <- gsub(
+  "^if_nsaid(_1)?$",
+  "NSAID use",
+  pretty_names)
+
+pretty_names <- gsub(
+  "^if_lipid(_1)?$",
+  "Lipid-lowering therapy",
+  pretty_names)
+
+pretty_names <- gsub(
+  "^if_beta(_1)?$",
+  "Beta blocking agents",
+  pretty_names)
+
+pretty_names <- gsub(
+  "^if_ra(_1)?$",
+  "Renin-Angiotensin system drug",
+  pretty_names)
+
+
+
+variable_labels <- setNames(
+  pretty_names,
+  balance_names)
+
+data.table(
+  original_name = balance_names,
+  displayed_name = pretty_names)
+p_balance <- love.plot(
+  balance_result,
+  stats = "mean.diffs",
+  abs = TRUE,
+  thresholds = c(m = 0.1),
+  var.order = "unadjusted",
+  sample.names = c(
+    "Before matching",
+    "After matching"),
+  colors = c(
+    "#c63d48",
+    "#4264a4"),
+  shapes = c(
+    16,
+    17),
+  line = FALSE,
+  size = 3,
+  var.names = variable_labels) +
+  labs(
+    title = "Gastrointestinal bleeding analysis",
+    x = "Absolute Standardized Mean Difference",
+    y = NULL) +
+  theme_bw(base_size = 11) +
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,
+      face = "bold",
+      size = 14),
+    legend.position = "top",
+    legend.title = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.y = element_line(
+      linewidth = 0.3,
+      colour = "grey90"),
+    panel.grid.major.x = element_line(
+      linewidth = 0.3,
+      colour = "grey85"),
+    axis.text.y = element_text(
+      size = 8.5,
+      colour = "black"),
+    axis.text.x = element_text(
+      size = 10,
+      colour = "black"),
+    axis.title.x = element_text(
+      face = "bold",
+      size = 11),
+    plot.margin = margin(
+      t = 5,
+      r = 15,
+      b = 5,
+      l = 25))
+p_balance
+
+
+
+
+
+
+
+
+
+#ob
+ob_cohort <- cohort_imp[,c("patid","gender","ethnicity","imd","age_at_AF","year_of_entry","alcohol_date",
+                           "ane_date","ckd_date","cpd_date","dementia_date","ld_date","cancer_date",
+                           "index_date","end_date1","ob_date","oac_date",
+                           "score1_factor","if_ob")]
+
+ob_cohort[, ob_end_date := fifelse(
+  !is.na(ob_date),
+  ob_date,
+  end_date1)]
+
+
+#step1: calculate total trial number for each participant
+setDT(ob_cohort)
+
+ob_cohort[, index_date := as.Date(index_date)]
+ob_cohort[, oac_date := as.Date(oac_date)]
+ob_cohort[, ob_end_date := as.Date(ob_end_date)]
+ob_cohort[, days_to_end := as.numeric(difftime(ob_end_date, index_date, units = "days"))]
+ob_cohort[, days_to_oac := as.numeric(difftime(oac_date, index_date, units = "days"))]
+
+ob_cohort[, total_trial_num := fifelse(
+  is.na(oac_date) | oac_date >= ob_end_date,
+  as.integer(floor(days_to_end / 30) + 1),
+  as.integer(floor(days_to_oac / 30) + 1))]
+#ob_cohort[, c("days_to_end", "days_to_oac") := NULL]
+table(ob_cohort$total_trial_num)
+
+
+#How many people in each trial
+trial_counts <- data.table(
+  trial_num = 1:max(ob_cohort$total_trial_num))
+
+trial_counts[, n := sapply(
+  trial_num,
+  function(i) sum(ob_cohort$total_trial_num >= i))]
+
+print(trial_counts, nrows = Inf)
+
+
+# Restrict the sequential trials to a maximum of 142
+ob_cohort[, total_trial_num := pmin(total_trial_num, 142L)]
+
+# Check the updated dobtrobution
+table(ob_cohort$total_trial_num)
+
+# Recalculate the number of participants in each trial
+trial_counts_142 <- data.table(
+  trial_num = 1:142)
+
+trial_counts_142[, n := sapply(
+  trial_num,
+  function(i) sum(ob_cohort$total_trial_num >= i))]
+
+print(trial_counts_142, nrows = Inf)
+
+
+
+#step2: Define the start and end date of each trial for each participant, if_IS, and followup days for each trial
+trial_data <- ob_cohort[
+  rep(seq_len(nrow(ob_cohort)), total_trial_num)]
+trial_data[, trial_num := seq_len(.N), by = patid]
+table(trial_data$trial_num)
+
+trial_data[, trial_start_date := index_date + (trial_num - 1) * 30]
+
+trial_data[, trial_end_date := pmin(
+  index_date + trial_num * 30 - 1,
+  ob_end_date)]
+
+trial_data[, .(
+  patid,
+  index_date,
+  ob_end_date,
+  total_trial_num,
+  trial_num,
+  trial_start_date,
+  trial_end_date)]
+
+#trial followup days
+trial_data[, trial_followup_days := as.numeric(
+  difftime(ob_end_date, trial_start_date, units = "days")) + 1]
+
+
+#step3: define each participant's OAC and time-dependent variable happens in which trial
+#Before that trial: 0;  after that trial: 1
+#OAC
+trial_data[, if_oac := fifelse(
+  !is.na(oac_date) &
+    oac_date >= trial_start_date &
+    oac_date <= trial_end_date,
+  1L, 0L)]
+
+trial_data[, .(n_oac_trial = sum(if_oac)), by = patid][
+  n_oac_trial > 1]
+trial_data[if_oac == 1 & trial_num != total_trial_num]
+
+#Time-dependent covariates
+#comorbidities
+trial_data[, if_ane := fifelse(
+  !is.na(ane_date) & ane_date < trial_start_date,
+  1L, 0L)]
+trial_data[, if_ckd := fifelse(
+  !is.na(ckd_date) & ckd_date < trial_start_date,
+  1L, 0L)]
+trial_data[, if_cpd := fifelse(
+  !is.na(cpd_date) & cpd_date < trial_start_date,
+  1L, 0L)]
+trial_data[, if_dementia := fifelse(
+  !is.na(dementia_date) & dementia_date < trial_start_date,
+  1L, 0L)]
+trial_data[, if_ld := fifelse(
+  !is.na(ld_date) & ld_date < trial_start_date,
+  1L, 0L)]
+trial_data[, if_cancer := fifelse(
+  !is.na(cancer_date) & cancer_date < trial_start_date,
+  1L, 0L)]
+trial_data[, if_alcohol := fifelse(
+  !is.na(alcohol_date) & alcohol_date < trial_start_date,
+  1L, 0L)]
+
+#Medication
+add_baseline_med <- function(trial_data,
+                             med_data,
+                             date_col,
+                             new_var,
+                             window_days = 365){
+  td <- copy(trial_data)
+  med <- copy(med_data)
+  setDT(td)
+  setDT(med)
+  td[, trial_id := .I]
+  td[, trial_start_date := as.Date(trial_start_date)]
+  med[, med_date := as.Date(get(date_col))]
+  trial_window <- td[, .(
+    trial_id,
+    patid,
+    window_start = trial_start_date - window_days,
+    window_end   = trial_start_date - 1
+  )]
+  med_flag <- med[
+    trial_window,
+    on = .(
+      patid,
+      med_date >= window_start,
+      med_date <= window_end
+    ),
+    nomatch = 0,
+    allow.cartesian = TRUE
+  ][,.(flag = 1L),by = trial_id]
+  td[, (new_var) := 0L]
+  td[
+    med_flag,
+    on = "trial_id",
+    (new_var) := i.flag]
+  td[, trial_id := NULL]
+  return(td)
+}
+
+# Antiplatelet
+trial_data <- add_baseline_med(
+  trial_data,
+  antip_pres,
+  "antip_date",
+  "if_antip")
+
+# Lipid-lowering
+trial_data <- add_baseline_med(
+  trial_data,
+  lipid_pres,
+  "lipid_date",
+  "if_lipid")
+
+# PPI
+trial_data <- add_baseline_med(
+  trial_data,
+  ppi_pres,
+  "ppi_date",
+  "if_ppi")
+
+# NSAID
+trial_data <- add_baseline_med(
+  trial_data,
+  nsaid_pres,
+  "nsaid_date",
+  "if_nsaid")
+
+# BETA
+trial_data <- add_baseline_med(
+  trial_data,
+  beta_pres,
+  "beta_date",
+  "if_beta")
+
+# RA
+trial_data <- add_baseline_med(
+  trial_data,
+  ra_pres,
+  "ra_date",
+  "if_ra")
+
+
+### PSM within each trial
+### 1:2 nearest-neighbor matching
+trial_data_model <- trial_data
+setDT(trial_data_model)
+# 1. Define matching variables
+match_vars <- c(
+  "age_at_AF", "gender", "ethnicity", "imd", "score1_factor","year_of_entry",
+  "if_ane", "if_ckd", "if_cpd", "if_dementia", "if_ld",  "if_cancer","if_alcohol",
+  "if_antip", "if_ppi", "if_nsaid", "if_lipid","if_beta","if_ra")
+
+factor_vars_psm <- c(
+  "gender", "ethnicity", "score1_factor",
+  "if_ane", "if_ckd", "if_cpd", "if_dementia", "if_ld",  "if_cancer","if_alcohol",
+  "if_antip", "if_ppi", "if_nsaid", "if_lipid","if_beta","if_ra")
+
+factor_vars_psm <- intersect(factor_vars_psm, names(trial_data_model))
+match_vars <- intersect(match_vars, names(trial_data_model))
+
+trial_data_model[, assigned_treat := as.integer(if_oac)]
+trial_data_model[, age_at_AF := as.numeric(as.character(age_at_AF))]
+trial_data_model[, imd := as.numeric(as.character(imd))]
+trial_data_model[, (factor_vars_psm) := lapply(.SD, as.factor), .SDcols = factor_vars_psm]
+
+psm_data <- trial_data_model[
+  complete.cases(trial_data_model[, ..match_vars]) &
+    !is.na(assigned_treat)]
+psm_data[, row_id_psm := .I]
+
+
+# 2. Function: match within one trial
+match_one_trial <- function(dt, ratio = 2) {
+  dt <- copy(dt)
+  thob_trial <- unique(dt$trial_num)
+  n_treat <- sum(dt$assigned_treat == 1, na.rm = TRUE)
+  n_control <- sum(dt$assigned_treat == 0, na.rm = TRUE)
+  if (n_treat == 0 | n_control == 0) {
+    return(list(
+      matched = NULL,
+      log = data.table(
+        trial_num = thob_trial,
+        n_treat = n_treat,
+        n_control = n_control,
+        matched_n = 0,
+        status = "Skipped: no treated or no control")))}
+  actual_ratio <- min(ratio, floor(n_control / n_treat))
+  if (actual_ratio < 1) {
+    return(list(
+      matched = NULL,
+      log = data.table(
+        trial_num = thob_trial,
+        n_treat = n_treat,
+        n_control = n_control,
+        matched_n = 0,
+        status = "Skipped: insufficient controls")))}
+  use_vars <- match_vars[
+    sapply(match_vars, function(v) {
+      length(unique(dt[[v]][!is.na(dt[[v]])])) > 1})]
+  if (length(use_vars) == 0) {
+    return(list(
+      matched = NULL,
+      log = data.table(
+        trial_num = thob_trial,
+        n_treat = n_treat,
+        n_control = n_control,
+        matched_n = 0,
+        status = "Skipped: no usable covariates")))}
+  
+  fml <- as.formula(
+    paste("assigned_treat ~", paste(use_vars, collapse = " + ")))
+  m <- tryCatch(
+    matchit(
+      formula = fml,
+      data = dt,
+      method = "nearest",
+      ratio = actual_ratio,
+      replace = FALSE,
+      distance = "glm",
+      caliper = 0.2
+    ),
+    error = function(e) e)
+  if (inherits(m, "error")) {
+    return(list(
+      matched = NULL,
+      log = data.table(
+        trial_num = thob_trial,
+        n_treat = n_treat,
+        n_control = n_control,
+        matched_n = 0,
+        status = paste0("Error: ", m$message))))}
+  matched <- as.data.table(match.data(m))
+  matched[, trial_num := thob_trial]
+  matched[, actual_ratio := actual_ratio]
+  return(list(
+    matched = matched,
+    log = data.table(
+      trial_num = thob_trial,
+      n_treat = n_treat,
+      n_control = n_control,
+      matched_n = nrow(matched),
+      status = paste0("Matched: 1:", actual_ratio))))}
+
+# 3. Run matching by trial
+psm_results <- psm_data[,
+                        {dt_one <- copy(.SD)
+                        dt_one[, trial_num := .BY$trial_num]
+                        res <- match_one_trial(dt_one, ratio = 2)
+                        .(matched = list(res$matched),
+                          log = list(res$log))},
+                        by = trial_num]
+
+matched_trial_data <- rbindlist(
+  psm_results$matched,
+  fill = TRUE)
+
+#Summary
+matched_trial_summary <- matched_trial_data[,.(
+  total_n = .N,
+  if_oac_1 = sum(if_oac == 1L, na.rm = TRUE),
+  if_oac_0 = sum(if_oac == 0L, na.rm = TRUE)),
+  by = trial_num][order(trial_num)]
+print(matched_trial_summary, nrows = Inf)
+all_trials <- data.table(
+  trial_num = 1:142)
+matched_trial_summary_full <- merge(
+  all_trials,
+  matched_trial_summary,
+  by = "trial_num",
+  all.x = TRUE)
+matched_trial_summary_full[
+  is.na(total_n),
+  `:=`(total_n = 0L,
+       if_oac_1 = 0L,
+       if_oac_0 = 0L)]
+print(matched_trial_summary_full,
+      nrows = Inf)
+
+
+
+cox_ob_full <- coxph(
+  Surv(trial_followup_days, if_ob == 1) ~ 
+    assigned_treat +
+    age_at_AF +gender + ethnicity + imd + score1_factor +year_of_entry+
+    if_ane + if_ckd + if_cpd + if_dementia + if_ld  + if_cancer + if_alcohol +
+    if_antip + if_ppi + if_nsaid + if_lipid + if_beta + if_ra +
+    cluster(patid),
+  data = matched_trial_data,
+  method = "efron")
+ShowRegTable(cox_ob_full)
+
+
+
+bal.tab(
+  assigned_treat ~ age_at_AF + gender + ethnicity + imd + score1_factor +year_of_entry+
+    if_ane + if_ckd + if_cpd + if_dementia + if_ld + if_cancer + if_alcohol+
+    if_antip + if_ppi + if_nsaid + if_lipid+if_beta+if_ra,
+  data = matched_trial_data,
+  weights = trial_data_iptw$weights*trial_data_iptw$IPTW_trunc)
+#none
+
+#Covariate balance plot
+#7*7
+setDT(psm_data)
+setDT(trial_data_iptw)
+stopifnot(
+  "row_id_psm" %in% names(psm_data),
+  "row_id_psm" %in% names(trial_data_iptw),
+  "weights" %in% names(trial_data_iptw))
+
+balance_data <- copy(psm_data)
+balance_data[, psm_weight := 0]
+matched_weights <- trial_data_iptw[
+  ,
+  .(
+    psm_weight = sum(weights, na.rm = TRUE)
+  ),
+  by = row_id_psm]
+
+balance_data[
+  matched_weights,
+  on = "row_id_psm",
+  psm_weight := i.psm_weight]
+
+balance_data[,
+             .(
+               before_matching = .N,
+               after_matching = sum(psm_weight > 0),
+               total_matching_weight = sum(psm_weight))]
+
+balance_data[
+  psm_weight > 0,
+  .(
+    N = .N,
+    weighted_N = sum(psm_weight)
+  ),
+  by = assigned_treat]
+
+balance_data[, ethnicity := as.character(ethnicity)]
+
+ethnicity_map <- c(
+  "0" = "White",
+  "1" = "Non-white")
+
+balance_data[
+  ,
+  ethnicity := factor(
+    ethnicity,
+    levels = names(ethnicity_map),
+    labels = unname(ethnicity_map))]
+
+table(balance_data$ethnicity, useNA = "ifany")
+
+balance_data[, score1_factor := as.character(score1_factor)]
+score_factor_map <- c(
+  "age65" = "Age 65 to 74 years",
+  "dm"    = "Diabetes mellitus",
+  "hf"    = "Heart failure",
+  "hpt"   = "Hypertension",
+  "vd"    = "Vascular disease")
+
+unknown_score_factor <- setdiff(
+  unique(na.omit(balance_data$score1_factor)),
+  names(score_factor_map))
+
+if (length(unknown_score_factor) > 0) {
+  warning(
+    "The following score1_factor levels were not included in score_factor_map: ",
+    paste(unknown_score_factor, collapse = ", "))}
+
+balance_data[
+  ,
+  score1_factor := factor(
+    score1_factor,
+    levels = names(score_factor_map),
+    labels = unname(score_factor_map))]
+
+table(balance_data$score1_factor, useNA = "ifany")
+
+balance_data[, assigned_treat := as.integer(assigned_treat)]
+balance_data[, age_at_AF := as.numeric(as.character(age_at_AF))]
+balance_data[, imd := as.numeric(as.character(imd))]
+
+binary_factor_vars <- c(
+  "gender",
+  "if_ane",
+  "if_ckd",
+  "if_cpd",
+  "if_dementia",
+  "if_ld",
+  "if_cancer",
+  "if_alcohol",
+  "if_antip",
+  "if_ppi",
+  "if_nsaid",
+  "if_lipid",
+  "if_beta",
+  "if_rd")
+
+binary_factor_vars <- intersect(
+  binary_factor_vars,
+  names(balance_data))
+
+balance_data[
+  ,
+  (binary_factor_vars) := lapply(.SD, as.factor),
+  .SDcols = binary_factor_vars]
+
+balance_formula <- assigned_treat ~
+  age_at_AF +
+  gender +
+  ethnicity +
+  imd +
+  score1_factor +
+  year_of_entry +
+  
+  if_ane +
+  if_ckd +
+  if_cpd +
+  if_dementia +
+  if_ld +
+  if_cancer +
+  if_alcohol +
+  if_antip +
+  if_ppi +
+  if_nsaid +
+  if_lipid +
+  if_beta +
+  if_ra
+
+balance_result <- bal.tab(
+  balance_formula,
+  data = balance_data,
+  weights = balance_data$psm_weight,
+  un = TRUE,
+  s.d.denom = "pooled",
+  binary = "std",
+  thresholds = c(m = 0.1))
+
+print(balance_result)
+
+balance_names <- rownames(balance_result$Balance)
+pretty_names <- balance_names
+
+pretty_names[balance_names == "age_at_AF"] <-
+  "Age (years)"
+
+pretty_names[balance_names == "imd"] <-
+  "Index of Multiple Deprivation"
+
+pretty_names <- gsub(
+  "^gender_.*$",
+  "Gender",
+  pretty_names)
+
+pretty_names <- gsub(
+  "^ethnicity_",
+  "Ethnicity: ",
+  pretty_names)
+
+pretty_names[balance_names == "year_of_entry"] <-
+  "Year of entry"
+
+pretty_names <- gsub(
+  "^score1_factor_",
+  "CHA2DS2-VASc factor: ",
+  pretty_names)
+
+pretty_names <- gsub(
+  "^if_ane(_1)?$",
+  "Anemia",
+  pretty_names)
+
+pretty_names <- gsub(
+  "^if_ckd(_1)?$",
+  "Renal disease",
+  pretty_names)
+
+pretty_names <- gsub(
+  "^if_cpd(_1)?$",
+  "Chronic respiratory disease",
+  pretty_names)
+
+pretty_names <- gsub(
+  "^if_dementia(_1)?$",
+  "Dementia",
+  pretty_names)
+
+pretty_names <- gsub(
+  "^if_ld(_1)?$",
+  "Liver disease",
+  pretty_names)
+
+pretty_names <- gsub(
+  "^if_cancer(_1)?$",
+  "Cancer",
+  pretty_names)
+
+pretty_names <- gsub(
+  "^if_alcohol(_1)?$",
+  "Alcohol misuse",
+  pretty_names)
+
+
+pretty_names <- gsub(
+  "^if_antip(_1)?$",
+  "Antiplatelet use",
+  pretty_names)
+
+pretty_names <- gsub(
+  "^if_ppi(_1)?$",
+  "PPI use",
+  pretty_names)
+
+pretty_names <- gsub(
+  "^if_nsaid(_1)?$",
+  "NSAID use",
+  pretty_names)
+
+pretty_names <- gsub(
+  "^if_lipid(_1)?$",
+  "Lipid-lowering therapy",
+  pretty_names)
+
+pretty_names <- gsub(
+  "^if_beta(_1)?$",
+  "Beta blocking agents",
+  pretty_names)
+
+pretty_names <- gsub(
+  "^if_ra(_1)?$",
+  "Renin-Angiotensin system drug",
+  pretty_names)
+
+
+
+variable_labels <- setNames(
+  pretty_names,
+  balance_names)
+
+data.table(
+  original_name = balance_names,
+  displayed_name = pretty_names)
+p_balance <- love.plot(
+  balance_result,
+  stats = "mean.diffs",
+  abs = TRUE,
+  thresholds = c(m = 0.1),
+  var.order = "unadjusted",
+  sample.names = c(
+    "Before matching",
+    "After matching"),
+  colors = c(
+    "#c63d48",
+    "#4264a4"),
+  shapes = c(
+    16,
+    17),
+  line = FALSE,
+  size = 3,
+  var.names = variable_labels) +
+  labs(
+    title = "Other bleeding analysis",
+    x = "Absolute Standardized Mean Difference",
+    y = NULL) +
+  theme_bw(base_size = 11) +
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,
+      face = "bold",
+      size = 14),
+    legend.position = "top",
+    legend.title = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.y = element_line(
+      linewidth = 0.3,
+      colour = "grey90"),
+    panel.grid.major.x = element_line(
+      linewidth = 0.3,
+      colour = "grey85"),
+    axis.text.y = element_text(
+      size = 8.5,
+      colour = "black"),
+    axis.text.x = element_text(
+      size = 10,
+      colour = "black"),
+    axis.title.x = element_text(
+      face = "bold",
+      size = 11),
+    plot.margin = margin(
+      t = 5,
+      r = 15,
+      b = 5,
+      l = 25))
+p_balance
+
+
 
